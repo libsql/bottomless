@@ -1,0 +1,13 @@
+[package]
+name = "bottomless"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+keywords = ["libsql", "sqlite", "s3", "vfs", "replication"]
+repository = "https://github.com/psarna/bottomless"
+description = "Bottomless VFS"
+
+[dependencies]
+
+[lib]
+crate-type = ["cdylib"]
