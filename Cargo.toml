@@ -8,6 +8,7 @@ repository = "https://github.com/psarna/bottomless"
 description = "Bottomless VFS"
 
 [dependencies]
+tracing = "0.1.37"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["staticlib"]
