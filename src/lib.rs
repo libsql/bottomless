@@ -1,52 +1,79 @@
 #![allow(non_snake_case)]
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 pub mod s3;
 
 use std::ffi::c_void;
-use std::sync::Arc;
-use tracing::{instrument, trace};
+use tracing::{info, instrument};
 
 const SQLITE_OK: i32 = 0;
 const SQLITE_CANTOPEN: i32 = 14;
+
+const SQLITE_LOCK_NONE: i32 = 0; /* xUnlock() only */
+const SQLITE_LOCK_SHARED: i32 = 1; /* xLock() or xUnlock() */
+const SQLITE_LOCK_RESERVED: i32 = 2; /* xLock() only */
+const SQLITE_LOCK_PENDING: i32 = 3; /* xLock() only */
+const SQLITE_LOCK_EXCLUSIVE: i32 = 4; /* xLock() only */
+
+fn lockstr(lock: i32) -> &'static str {
+    match lock {
+        SQLITE_LOCK_NONE => "none",
+        SQLITE_LOCK_SHARED => "shared",
+        SQLITE_LOCK_RESERVED => "reserved",
+        SQLITE_LOCK_PENDING => "pending",
+        SQLITE_LOCK_EXCLUSIVE => "exclusive",
+        _ => panic!("invalid lock"),
+    }
+}
 
 #[repr(C)]
 #[derive(Debug)]
 pub struct sqlite3_io_methods {
     iVersion: i32,
-    xClose: unsafe extern "C" fn(file: *mut BottomlessFile) -> i32,
-    xRead:
-        unsafe extern "C" fn(file: *mut BottomlessFile, buf: *mut c_void, n: i32, off: i64) -> i32,
-    xWrite:
-        unsafe extern "C" fn(file: *mut BottomlessFile, buf: *const u8, n: i32, off: i64) -> i32,
-    xTruncate: unsafe extern "C" fn(file: *mut BottomlessFile, size: i64) -> i32,
-    xSync: unsafe extern "C" fn(file: *mut BottomlessFile, flags: i32) -> i32,
-    xFileSize: unsafe extern "C" fn(file: *mut BottomlessFile, size: *mut i64) -> i32,
-    xLock: unsafe extern "C" fn(file: *mut BottomlessFile, lock: i32) -> i32,
-    xUnlock: unsafe extern "C" fn(file: *mut BottomlessFile, lock: i32) -> i32,
-    xCheckReservedLock: unsafe extern "C" fn(file: *mut BottomlessFile, res: *mut i32) -> i32,
-    xFileControl: unsafe extern "C" fn(file: *mut BottomlessFile, op: i32, arg: *mut c_void) -> i32,
-    xSectorSize: unsafe extern "C" fn(file: *mut BottomlessFile) -> i32,
-    xDeviceCharacteristics: unsafe extern "C" fn(file: *mut BottomlessFile) -> i32,
+    xClose: unsafe extern "C" fn(file_ptr: *mut BottomlessFile) -> i32,
+    xRead: unsafe extern "C" fn(
+        file_ptr: *mut BottomlessFile,
+        buf: *mut c_void,
+        n: i32,
+        off: i64,
+    ) -> i32,
+    xWrite: unsafe extern "C" fn(
+        file_ptr: *mut BottomlessFile,
+        buf: *const u8,
+        n: i32,
+        off: i64,
+    ) -> i32,
+    xTruncate: unsafe extern "C" fn(file_ptr: *mut BottomlessFile, size: i64) -> i32,
+    xSync: unsafe extern "C" fn(file_ptr: *mut BottomlessFile, flags: i32) -> i32,
+    xFileSize: unsafe extern "C" fn(file_ptr: *mut BottomlessFile, size: *mut i64) -> i32,
+    xLock: unsafe extern "C" fn(file_ptr: *mut BottomlessFile, lock: i32) -> i32,
+    xUnlock: unsafe extern "C" fn(file_ptr: *mut BottomlessFile, lock: i32) -> i32,
+    xCheckReservedLock: unsafe extern "C" fn(file_ptr: *mut BottomlessFile, res: *mut i32) -> i32,
+    xFileControl:
+        unsafe extern "C" fn(file_ptr: *mut BottomlessFile, op: i32, arg: *mut c_void) -> i32,
+    xSectorSize: unsafe extern "C" fn(file_ptr: *mut BottomlessFile) -> i32,
+    xDeviceCharacteristics: unsafe extern "C" fn(file_ptr: *mut BottomlessFile) -> i32,
     // v2
     xShmMap: unsafe extern "C" fn(
-        file: *mut BottomlessFile,
+        file_ptr: *mut BottomlessFile,
         pgno: i32,
         pgsize: i32,
         arg: i32,
         addr: *mut *mut c_void,
     ) -> i32,
     xShmLock:
-        unsafe extern "C" fn(file: *mut BottomlessFile, offset: i32, n: i32, flags: i32) -> i32,
-    xShmBarrier: unsafe extern "C" fn(file: *mut BottomlessFile),
-    xShmUnmap: unsafe extern "C" fn(file: *mut BottomlessFile, delete_flag: i32) -> i32,
+        unsafe extern "C" fn(file_ptr: *mut BottomlessFile, offset: i32, n: i32, flags: i32) -> i32,
+    xShmBarrier: unsafe extern "C" fn(file_ptr: *mut BottomlessFile),
+    xShmUnmap: unsafe extern "C" fn(file_ptr: *mut BottomlessFile, delete_flag: i32) -> i32,
     // v3
     xFetch: unsafe extern "C" fn(
-        file: *mut BottomlessFile,
+        file_ptr: *mut BottomlessFile,
         off: i64,
         n: i32,
         addr: *mut *mut c_void,
     ) -> i32,
-    xUnfetch: unsafe extern "C" fn(file: *mut BottomlessFile, off: i64, addr: *mut c_void) -> i32,
+    xUnfetch:
+        unsafe extern "C" fn(file_ptr: *mut BottomlessFile, off: i64, addr: *mut c_void) -> i32,
 }
 
 #[repr(C)]
@@ -61,7 +88,8 @@ pub struct BottomlessFile {
     methods: *const sqlite3_io_methods,
     native_file: *mut sqlite3_file,
     name: String,
-    replicator: Option<Arc<s3::Replicator>>,
+    lock: i32,
+    replicator: Option<Box<s3::Replicator>>,
 }
 
 #[repr(C)]
@@ -105,97 +133,107 @@ pub struct sqlite3_vfs {
     */
 }
 
-fn native_handle(file: *mut BottomlessFile) -> *mut BottomlessFile {
-    unsafe { (*file).native_file as *mut BottomlessFile }
+fn native_handle(file_ptr: *mut BottomlessFile) -> *mut BottomlessFile {
+    unsafe { (*file_ptr).native_file as *mut BottomlessFile }
 }
 
-#[instrument]
-unsafe extern "C" fn xClose(file: *mut BottomlessFile) -> i32 {
-    trace!("");
-    ((*(*(*file).native_file).methods).xClose)(native_handle(file))
+#[instrument(skip(file_ptr))]
+unsafe extern "C" fn xClose(file_ptr: *mut BottomlessFile) -> i32 {
+    info!("");
+    ((*(*(*file_ptr).native_file).methods).xClose)(native_handle(file_ptr))
 }
 
-#[instrument]
-unsafe extern "C" fn xRead(file: *mut BottomlessFile, buf: *mut c_void, n: i32, off: i64) -> i32 {
-    trace!("reading {}:{}", off, n);
-    ((*(*(*file).native_file).methods).xRead)(native_handle(file), buf, n, off)
+#[instrument(skip(file_ptr))]
+unsafe extern "C" fn xRead(
+    file_ptr: *mut BottomlessFile,
+    buf: *mut c_void,
+    n: i32,
+    off: i64,
+) -> i32 {
+    info!("reading {}:{}", off, n);
+    ((*(*(*file_ptr).native_file).methods).xRead)(native_handle(file_ptr), buf, n, off)
 }
 
-#[instrument]
+#[instrument(skip(file_ptr))]
 unsafe extern "C" fn xWrite(
     file_ptr: *mut BottomlessFile,
     buf: *const u8,
     n: i32,
     off: i64,
 ) -> i32 {
-    trace!("writing {}:{}", off, n);
     let file = &mut *file_ptr;
+    info!("Writing {}:{} to {}", off, n, file.name);
     let data = std::slice::from_raw_parts(buf, n as usize);
-    file.replicator.as_ref().unwrap().send(
-        /*fixme: derived from db name*/ "libsql",
-        off as usize,
-        data,
-    );
-    ((*(*(*file).native_file).methods).xWrite)(native_handle(file_ptr), buf, n, off)
+    file.replicator.as_mut().unwrap().write(off, data);
+    ((*(*(*file_ptr).native_file).methods).xWrite)(native_handle(file_ptr), buf, n, off)
 }
 
-#[instrument]
-unsafe extern "C" fn xTruncate(file: *mut BottomlessFile, size: i64) -> i32 {
-    trace!("");
-    ((*(*(*file).native_file).methods).xTruncate)(native_handle(file), size)
+#[instrument(skip(file_ptr))]
+unsafe extern "C" fn xTruncate(file_ptr: *mut BottomlessFile, size: i64) -> i32 {
+    info!("");
+    ((*(*(*file_ptr).native_file).methods).xTruncate)(native_handle(file_ptr), size)
 }
 
-#[instrument]
-unsafe extern "C" fn xSync(file: *mut BottomlessFile, flags: i32) -> i32 {
-    trace!("");
-    ((*(*(*file).native_file).methods).xSync)(native_handle(file), flags)
+#[instrument(skip(file_ptr))]
+unsafe extern "C" fn xSync(file_ptr: *mut BottomlessFile, flags: i32) -> i32 {
+    info!("");
+    ((*(*(*file_ptr).native_file).methods).xSync)(native_handle(file_ptr), flags)
 }
 
-#[instrument]
-unsafe extern "C" fn xFileSize(file: *mut BottomlessFile, size: *mut i64) -> i32 {
-    trace!("");
-    ((*(*(*file).native_file).methods).xFileSize)(native_handle(file), size)
+#[instrument(skip(file_ptr))]
+unsafe extern "C" fn xFileSize(file_ptr: *mut BottomlessFile, size: *mut i64) -> i32 {
+    info!("");
+    ((*(*(*file_ptr).native_file).methods).xFileSize)(native_handle(file_ptr), size)
 }
 
-#[instrument]
-unsafe extern "C" fn xLock(file: *mut BottomlessFile, lock: i32) -> i32 {
-    trace!("");
-    ((*(*(*file).native_file).methods).xLock)(native_handle(file), lock)
+#[instrument(skip(file_ptr))]
+unsafe extern "C" fn xLock(file_ptr: *mut BottomlessFile, lock: i32) -> i32 {
+    let file = &mut *file_ptr;
+    file.lock = lock;
+    info!("Lock: {} -> {}", lockstr(file.lock), lockstr(lock));
+    ((*(*(*file_ptr).native_file).methods).xLock)(native_handle(file_ptr), lock)
 }
 
-#[instrument]
-unsafe extern "C" fn xUnlock(file: *mut BottomlessFile, lock: i32) -> i32 {
-    trace!("");
-    ((*(*(*file).native_file).methods).xUnlock)(native_handle(file), lock)
+#[instrument(skip(file_ptr))]
+unsafe extern "C" fn xUnlock(file_ptr: *mut BottomlessFile, lock: i32) -> i32 {
+    let file = &mut *file_ptr;
+    info!("Unlock: {} -> {}", lockstr(file.lock), lockstr(lock));
+    if file.lock >= SQLITE_LOCK_RESERVED && lock < SQLITE_LOCK_RESERVED {
+        file.replicator
+            .as_mut()
+            .unwrap()
+            .commit("libsql", &file.name);
+    }
+    ((*(*(*file_ptr).native_file).methods).xUnlock)(native_handle(file_ptr), lock)
 }
 
-#[instrument]
-unsafe extern "C" fn xCheckReservedLock(file: *mut BottomlessFile, res: *mut i32) -> i32 {
-    trace!("");
-    ((*(*(*file).native_file).methods).xCheckReservedLock)(native_handle(file), res)
+#[instrument(skip(file_ptr))]
+unsafe extern "C" fn xCheckReservedLock(file_ptr: *mut BottomlessFile, res: *mut i32) -> i32 {
+    info!("");
+    ((*(*(*file_ptr).native_file).methods).xCheckReservedLock)(native_handle(file_ptr), res)
 }
 
-#[instrument]
-unsafe extern "C" fn xFileControl(file: *mut BottomlessFile, op: i32, arg: *mut c_void) -> i32 {
-    trace!("");
-    ((*(*(*file).native_file).methods).xFileControl)(native_handle(file), op, arg)
+#[instrument(skip(file_ptr))]
+unsafe extern "C" fn xFileControl(file_ptr: *mut BottomlessFile, op: i32, arg: *mut c_void) -> i32 {
+    info!("");
+    ((*(*(*file_ptr).native_file).methods).xFileControl)(native_handle(file_ptr), op, arg)
 }
 
-#[instrument]
-unsafe extern "C" fn xSectorSize(file: *mut BottomlessFile) -> i32 {
-    trace!("");
-    ((*(*(*file).native_file).methods).xSectorSize)(native_handle(file))
+#[instrument(skip(file_ptr))]
+unsafe extern "C" fn xSectorSize(file_ptr: *mut BottomlessFile) -> i32 {
+    info!("");
+    ((*(*(*file_ptr).native_file).methods).xSectorSize)(native_handle(file_ptr))
 }
 
-#[instrument]
-unsafe extern "C" fn xDeviceCharacteristics(file: *mut BottomlessFile) -> i32 {
-    trace!("");
-    ((*(*(*file).native_file).methods).xDeviceCharacteristics)(native_handle(file))
+#[instrument(skip(file_ptr))]
+unsafe extern "C" fn xDeviceCharacteristics(file_ptr: *mut BottomlessFile) -> i32 {
+    info!("");
+    ((*(*(*file_ptr).native_file).methods).xDeviceCharacteristics)(native_handle(file_ptr))
 }
 
 #[instrument]
 unsafe extern "C" fn xShmMap(
-    _file: *mut BottomlessFile,
+    _file_ptr: *mut BottomlessFile,
     _pgno: i32,
     _pgsize: i32,
     _arg: i32,
@@ -206,7 +244,7 @@ unsafe extern "C" fn xShmMap(
 
 #[instrument]
 unsafe extern "C" fn xShmLock(
-    _file: *mut BottomlessFile,
+    _file_ptr: *mut BottomlessFile,
     _offset: i32,
     _n: i32,
     _flags: i32,
@@ -215,24 +253,31 @@ unsafe extern "C" fn xShmLock(
 }
 
 #[instrument]
-unsafe extern "C" fn xShmBarrier(_file: *mut BottomlessFile) {
+unsafe extern "C" fn xShmBarrier(_file_ptr: *mut BottomlessFile) {
     unimplemented!()
 }
 
 #[instrument]
-unsafe extern "C" fn xShmUnmap(_file: *mut BottomlessFile, _delete_flag: i32) -> i32 {
+unsafe extern "C" fn xShmUnmap(_file_ptr: *mut BottomlessFile, _delete_flag: i32) -> i32 {
     unimplemented!()
 }
 
+#[instrument]
 unsafe extern "C" fn xFetch(
-    _file: *mut BottomlessFile,
+    _file_ptr: *mut BottomlessFile,
     _off: i64,
     _n: i32,
     _addr: *mut *mut c_void,
 ) -> i32 {
     unimplemented!()
 }
-unsafe extern "C" fn xUnfetch(_file: *mut BottomlessFile, _off: i64, _addr: *mut c_void) -> i32 {
+
+#[instrument]
+unsafe extern "C" fn xUnfetch(
+    _file_ptr: *mut BottomlessFile,
+    _off: i64,
+    _addr: *mut c_void,
+) -> i32 {
     unimplemented!()
 }
 
@@ -259,7 +304,7 @@ const BOTTOMLESS_METHODS: sqlite3_io_methods = sqlite3_io_methods {
 };
 
 fn get_base_vfs_ptr(vfs: *mut sqlite3_vfs) -> *mut sqlite3_vfs {
-    trace!("base vfs: {:?}", unsafe {
+    info!("base vfs: {:?}", unsafe {
         (*vfs).pData as *mut sqlite3_vfs
     });
     unsafe { (*vfs).pData as *mut sqlite3_vfs }
@@ -287,35 +332,33 @@ pub fn open_impl(
     let base_vfs_ptr = get_base_vfs_ptr(vfs);
     let base_vfs: &mut sqlite3_vfs = unsafe { &mut *base_vfs_ptr };
 
-    trace!("Name: <{}>", cstr(name));
+    info!("Opening {}", cstr(name));
 
     let file: &mut BottomlessFile = unsafe { &mut *(file as *mut BottomlessFile) };
 
     file.methods = &BOTTOMLESS_METHODS as *const sqlite3_io_methods;
     file.name = cstr(name);
     let replicator = s3::Replicator::new();
-    file.replicator = Some(Arc::new(replicator));
+    file.replicator = Some(Box::new(replicator));
 
     let layout = match std::alloc::Layout::from_size_align(base_vfs.szOsFile as usize, 8) {
         Ok(l) => l,
         Err(_) => return SQLITE_CANTOPEN,
     };
-    trace!("Layout: {:?}", layout);
     file.native_file = unsafe { std::alloc::alloc(layout) as *mut sqlite3_file };
     let native_ret =
-        unsafe { ((*base_vfs).xOpen)(base_vfs_ptr, name, file.native_file, flags, out_flags) };
-    trace!("Native file open: {}", native_ret);
+        unsafe { (base_vfs.xOpen)(base_vfs_ptr, name, file.native_file, flags, out_flags) };
     if native_ret != SQLITE_OK {
         return native_ret;
     }
-    trace!("ok");
+    info!("ok");
     SQLITE_OK
 }
 
 #[no_mangle]
 pub fn bottomless_init() {
     tracing_subscriber::fmt::init();
-    trace!("init");
+    info!("init");
 }
 
 #[no_mangle]
@@ -323,7 +366,7 @@ pub fn bottomless_init() {
 pub fn delete_impl(vfs: *mut sqlite3_vfs, name: *const i8, sync_dir: i32) -> i32 {
     let base_vfs_ptr = get_base_vfs_ptr(vfs);
     let base_vfs: &mut sqlite3_vfs = unsafe { &mut *base_vfs_ptr };
-    unsafe { ((*base_vfs).xDelete)(base_vfs_ptr, name, sync_dir) }
+    unsafe { (base_vfs.xDelete)(base_vfs_ptr, name, sync_dir) }
 }
 
 #[no_mangle]
@@ -331,7 +374,7 @@ pub fn delete_impl(vfs: *mut sqlite3_vfs, name: *const i8, sync_dir: i32) -> i32
 pub fn access_impl(vfs: *mut sqlite3_vfs, name: *const i8, flags: i32, res: *mut i32) -> i32 {
     let base_vfs_ptr = get_base_vfs_ptr(vfs);
     let base_vfs: &mut sqlite3_vfs = unsafe { &mut *base_vfs_ptr };
-    unsafe { ((*base_vfs).xAccess)(base_vfs_ptr, name, flags, res) }
+    unsafe { (base_vfs.xAccess)(base_vfs_ptr, name, flags, res) }
 }
 
 #[no_mangle]
@@ -339,7 +382,7 @@ pub fn access_impl(vfs: *mut sqlite3_vfs, name: *const i8, flags: i32, res: *mut
 pub fn full_pathname_impl(vfs: *mut sqlite3_vfs, name: *const i8, n: i32, out: *mut i8) -> i32 {
     let base_vfs_ptr = get_base_vfs_ptr(vfs);
     let base_vfs: &mut sqlite3_vfs = unsafe { &mut *base_vfs_ptr };
-    unsafe { ((*base_vfs).xFullPathname)(base_vfs_ptr, name, n, out) };
-    trace!("Pathname: {}", cstr(out));
+    unsafe { (base_vfs.xFullPathname)(base_vfs_ptr, name, n, out) };
+    info!("Pathname: {}", cstr(out));
     SQLITE_OK
 }
