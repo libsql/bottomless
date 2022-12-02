@@ -4,7 +4,7 @@
 pub mod s3;
 
 use std::ffi::{c_void, CStr};
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 
 const SQLITE_OK: i32 = 0;
 const SQLITE_CANTOPEN: i32 = 14;
@@ -320,7 +320,7 @@ fn get_base_vfs_ptr(vfs: *mut sqlite3_vfs) -> *mut sqlite3_vfs {
 
 // VFS Methods
 #[no_mangle]
-#[instrument]
+#[instrument(skip(vfs, name, file, out_flags))]
 pub fn open_impl(
     vfs: *mut sqlite3_vfs,
     name: *const i8,
@@ -367,7 +367,43 @@ pub fn open_impl(
     if native_ret != SQLITE_OK {
         return native_ret;
     }
-    info!("ok");
+
+    let mut native_size: i64 = 0;
+    unsafe {
+        xFileSize(file as *mut BottomlessFile, &mut native_size as *mut i64);
+    }
+
+    if native_size > 0 {
+        warn!(
+            "Database file not empty ({} pages), not bootstrapping!",
+            native_size / s3::Replicator::PAGE_SIZE as i64
+        );
+    } else {
+        let pages = match file.replicator.as_mut().unwrap().boot("libsql") {
+            Ok(pages) => pages,
+            Err(e) => {
+                error!("Bootstrapping from the replicator failed: {}", e);
+                return SQLITE_CANTOPEN;
+            }
+        };
+        for (pgno, data) in pages {
+            info!("Writting page {} from the replicator locally", pgno);
+            unsafe {
+                let rc = ((*(*file.native_file).methods).xWrite)(
+                    file.native_file as *mut BottomlessFile,
+                    data.as_ptr(),
+                    s3::Replicator::PAGE_SIZE as i32,
+                    pgno as i64 * s3::Replicator::PAGE_SIZE as i64,
+                );
+                info!("Write status: {}", rc);
+                if rc != SQLITE_OK {
+                    error!("Failed to apply page {} during remote bootstrap", pgno);
+                    return SQLITE_CANTOPEN;
+                }
+            }
+        }
+    }
+
     SQLITE_OK
 }
 

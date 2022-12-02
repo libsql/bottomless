@@ -1,9 +1,9 @@
 use aws_sdk_s3::types::ByteStream;
 use aws_sdk_s3::{Client, Endpoint};
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use tokio::runtime::{Builder, Runtime};
-use tracing::info;
+use tracing::{error, info};
 
 pub type Result<T> = anyhow::Result<T>;
 
@@ -15,6 +15,8 @@ pub struct Replicator {
 }
 
 impl Replicator {
+    pub const PAGE_SIZE: usize = 4096;
+
     pub fn new() -> Result<Self> {
         let runtime = Builder::new_current_thread().enable_all().build()?;
         let write_buffer = HashMap::new();
@@ -42,13 +44,19 @@ impl Replicator {
         self.write_buffer.insert(offset, bytes);
     }
 
+    // Sends the pages participating in a commit to S3
     pub fn commit(&mut self, bucket: &str, prefix: &str) -> Result<()> {
         info!("Write buffer size: {}", self.write_buffer.len());
         self.runtime.block_on(async {
-            // TODO: concurrency
             for (offset, bytes) in &self.write_buffer {
                 let data: &[u8] = bytes;
-                let key = format!("{}-{}", prefix, offset);
+                if data.len() != Self::PAGE_SIZE {
+                    return Err(anyhow::anyhow!(
+                        "Unexpected write not equal to page size: {}",
+                        data.len()
+                    ));
+                }
+                let key = format!("{}-{:012}", prefix, offset / Self::PAGE_SIZE as i64);
                 info!("Committing {}", key);
                 self.client
                     .put_object()
@@ -62,5 +70,42 @@ impl Replicator {
             Ok::<(), anyhow::Error>(())
         })?;
         Ok(())
+    }
+
+    pub fn boot(&self, bucket: &str) -> Result<Vec<(i32, Bytes)>> {
+        info!("Bootstrapping");
+        self.runtime.block_on(async {
+            let mut pages = Vec::new();
+            let objs = self.client.list_objects().bucket(bucket).send().await?;
+            let objs = match objs.contents() {
+                Some(objs) => objs,
+                None => return Ok(pages),
+            };
+            for obj in objs {
+                let key = obj
+                    .key()
+                    .ok_or_else(|| anyhow::anyhow!("Failed to get key for an object"))?;
+                info!("Object {}", key);
+                let page = self
+                    .client
+                    .get_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .send()
+                    .await?;
+                // Format: <db-name>-<page-no>
+                match key
+                    .rfind('-')
+                    .map(|index| key[index + 1..].parse::<i32>().ok())
+                {
+                    Some(Some(pgno)) => {
+                        let data = page.body.collect().await.map(|data| data.into_bytes())?;
+                        pages.push((pgno, data));
+                    }
+                    _ => error!("Failed to parse page number from key {}", key),
+                }
+            }
+            Ok(pages)
+        })
     }
 }
