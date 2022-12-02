@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use tokio::runtime::{Builder, Runtime};
 use tracing::info;
 
+pub type Result<T> = anyhow::Result<T>;
+
 #[derive(Debug)]
 pub struct Replicator {
     client: Client,
@@ -13,28 +15,24 @@ pub struct Replicator {
 }
 
 impl Replicator {
-    pub fn new() -> Self {
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .unwrap();
+    pub fn new() -> Result<Self> {
+        let runtime = Builder::new_current_thread().enable_all().build()?;
         let write_buffer = HashMap::new();
+        let endpoint = std::env::var("LIBSQL_BOTTOMLESS_ENDPOINT")
+            .unwrap_or_else(|_| "http://localhost:9000".to_string());
         let client = runtime.block_on(async {
-            Client::new(
+            Ok::<Client, anyhow::Error>(Client::new(
                 &aws_config::from_env()
-                    .endpoint_resolver(Endpoint::immutable(
-                        "http://localhost:9000".parse().expect("valid URI"),
-                    ))
+                    .endpoint_resolver(Endpoint::immutable(endpoint.parse()?))
                     .load()
                     .await,
-            )
-        });
-        Self {
+            ))
+        })?;
+        Ok(Self {
             client,
             write_buffer,
             runtime,
-        }
+        })
     }
 
     pub fn write(&mut self, offset: i64, data: &[u8]) {
@@ -44,13 +42,13 @@ impl Replicator {
         self.write_buffer.insert(offset, bytes);
     }
 
-    pub fn commit(&mut self, bucket: &str, prefix: &str) {
+    pub fn commit(&mut self, bucket: &str, prefix: &str) -> Result<()> {
         info!("Write buffer size: {}", self.write_buffer.len());
         self.runtime.block_on(async {
             // TODO: concurrency
             for (offset, bytes) in &self.write_buffer {
                 let data: &[u8] = bytes;
-                let key = format!("{}-{}:{}", prefix, offset, data.len());
+                let key = format!("{}-{}", prefix, offset);
                 info!("Committing {}", key);
                 self.client
                     .put_object()
@@ -58,16 +56,11 @@ impl Replicator {
                     .key(key)
                     .body(ByteStream::from(data.to_owned()))
                     .send()
-                    .await
-                    .expect("sent");
+                    .await?;
             }
             self.write_buffer.clear();
-        });
-    }
-}
-
-impl Default for Replicator {
-    fn default() -> Self {
-        Self::new()
+            Ok::<(), anyhow::Error>(())
+        })?;
+        Ok(())
     }
 }

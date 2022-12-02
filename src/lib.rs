@@ -3,11 +3,13 @@
 
 pub mod s3;
 
-use std::ffi::c_void;
-use tracing::{info, instrument};
+use std::ffi::{c_void, CStr};
+use tracing::{debug, error, info, instrument};
 
 const SQLITE_OK: i32 = 0;
 const SQLITE_CANTOPEN: i32 = 14;
+const SQLITE_IOERR: i32 = 10;
+const SQLITE_IOERR_UNLOCK: i32 = SQLITE_IOERR | 8 << 8;
 
 const SQLITE_LOCK_NONE: i32 = 0; /* xUnlock() only */
 const SQLITE_LOCK_SHARED: i32 = 1; /* xLock() or xUnlock() */
@@ -199,10 +201,16 @@ unsafe extern "C" fn xUnlock(file_ptr: *mut BottomlessFile, lock: i32) -> i32 {
     let file = &mut *file_ptr;
     info!("Unlock: {} -> {}", lockstr(file.lock), lockstr(lock));
     if file.lock >= SQLITE_LOCK_RESERVED && lock < SQLITE_LOCK_RESERVED {
-        file.replicator
+        if let Err(e) = file
+            .replicator
             .as_mut()
             .unwrap()
-            .commit("libsql", &file.name);
+            .commit("libsql", &file.name)
+        {
+            error!("Commit replication failed: {}", e);
+            //TODO: perhaps it's better to write locally anyway
+            return SQLITE_IOERR_UNLOCK;
+        }
     }
     ((*(*(*file_ptr).native_file).methods).xUnlock)(native_handle(file_ptr), lock)
 }
@@ -310,15 +318,6 @@ fn get_base_vfs_ptr(vfs: *mut sqlite3_vfs) -> *mut sqlite3_vfs {
     unsafe { (*vfs).pData as *mut sqlite3_vfs }
 }
 
-fn cstr(input: *const i8) -> String {
-    unsafe {
-        std::ffi::CStr::from_ptr(input)
-            .to_str()
-            .unwrap()
-            .to_string()
-    }
-}
-
 // VFS Methods
 #[no_mangle]
 #[instrument]
@@ -332,13 +331,30 @@ pub fn open_impl(
     let base_vfs_ptr = get_base_vfs_ptr(vfs);
     let base_vfs: &mut sqlite3_vfs = unsafe { &mut *base_vfs_ptr };
 
-    info!("Opening {}", cstr(name));
+    debug!("Opening {:?}", unsafe { CStr::from_ptr(name) });
 
     let file: &mut BottomlessFile = unsafe { &mut *(file as *mut BottomlessFile) };
 
     file.methods = &BOTTOMLESS_METHODS as *const sqlite3_io_methods;
-    file.name = cstr(name);
-    let replicator = s3::Replicator::new();
+    let name_str = match unsafe { CStr::from_ptr(name).to_str() } {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to parse file name: {}", e);
+            return SQLITE_CANTOPEN;
+        }
+    };
+    file.name = match name_str.rfind('/') {
+        Some(index) => name_str[index..].to_string(),
+        None => name_str.to_string(),
+    };
+
+    let replicator = match s3::Replicator::new() {
+        Ok(r) => r,
+        Err(e) => {
+            error!("Replicator init failed: {}", e);
+            return SQLITE_CANTOPEN;
+        }
+    };
     file.replicator = Some(Box::new(replicator));
 
     let layout = match std::alloc::Layout::from_size_align(base_vfs.szOsFile as usize, 8) {
@@ -383,6 +399,6 @@ pub fn full_pathname_impl(vfs: *mut sqlite3_vfs, name: *const i8, n: i32, out: *
     let base_vfs_ptr = get_base_vfs_ptr(vfs);
     let base_vfs: &mut sqlite3_vfs = unsafe { &mut *base_vfs_ptr };
     unsafe { (base_vfs.xFullPathname)(base_vfs_ptr, name, n, out) };
-    info!("Pathname: {}", cstr(out));
+    debug!("Pathname: {:?}", unsafe { CStr::from_ptr(out) });
     SQLITE_OK
 }
