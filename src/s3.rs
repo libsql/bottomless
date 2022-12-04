@@ -12,12 +12,15 @@ pub struct Replicator {
     client: Client,
     write_buffer: HashMap<i64, BytesMut>,
     runtime: Runtime,
+
+    pub(crate) bucket: String,
+    pub(crate) db_name: String,
 }
 
 impl Replicator {
     pub const PAGE_SIZE: usize = 4096;
 
-    pub fn new() -> Result<Self> {
+    pub fn new(db_name: impl Into<String>) -> Result<Self> {
         let runtime = Builder::new_current_thread().enable_all().build()?;
         let write_buffer = HashMap::new();
         let endpoint = std::env::var("LIBSQL_BOTTOMLESS_ENDPOINT")
@@ -30,10 +33,14 @@ impl Replicator {
                     .await,
             ))
         })?;
+        let bucket =
+            std::env::var("LIBSQL_BOTTOMLESS_BUCKET").unwrap_or_else(|_| "bottomless".to_string());
         Ok(Self {
             client,
             write_buffer,
             runtime,
+            bucket,
+            db_name: db_name.into(),
         })
     }
 
@@ -45,7 +52,7 @@ impl Replicator {
     }
 
     // Sends the pages participating in a commit to S3
-    pub fn commit(&mut self, bucket: &str, prefix: &str) -> Result<()> {
+    pub fn commit(&mut self) -> Result<()> {
         info!("Write buffer size: {}", self.write_buffer.len());
         self.runtime.block_on(async {
             for (offset, bytes) in &self.write_buffer {
@@ -56,11 +63,11 @@ impl Replicator {
                         data.len()
                     ));
                 }
-                let key = format!("{}-{:012}", prefix, offset / Self::PAGE_SIZE as i64);
+                let key = format!("{}-{:012}", self.db_name, offset / Self::PAGE_SIZE as i64);
                 info!("Committing {}", key);
                 self.client
                     .put_object()
-                    .bucket(bucket)
+                    .bucket(&self.bucket)
                     .key(key)
                     .body(ByteStream::from(data.to_owned()))
                     .send()
@@ -72,11 +79,35 @@ impl Replicator {
         Ok(())
     }
 
-    pub fn boot(&self, bucket: &str) -> Result<Vec<(i32, Bytes)>> {
+    pub fn is_bucket_empty(&self) -> bool {
+        self.runtime
+            .block_on(async {
+                let objs = self
+                    .client
+                    .list_objects()
+                    .bucket(&self.bucket)
+                    .send()
+                    .await?;
+                match objs.contents() {
+                    Some(objs) => Ok::<bool, anyhow::Error>(objs.is_empty()),
+                    None => return Ok::<bool, anyhow::Error>(true),
+                }
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn boot(&self) -> Result<Vec<(i32, Bytes)>> {
         info!("Bootstrapping");
         self.runtime.block_on(async {
             let mut pages = Vec::new();
-            let objs = self.client.list_objects().bucket(bucket).send().await?;
+            //FIXME: list_objects is paged! is_truncated() and next_marker() need to be used
+            // to iterate over everything
+            let objs = self
+                .client
+                .list_objects()
+                .bucket(&self.bucket)
+                .send()
+                .await?;
             let objs = match objs.contents() {
                 Some(objs) => objs,
                 None => return Ok(pages),
@@ -89,7 +120,7 @@ impl Replicator {
                 let page = self
                     .client
                     .get_object()
-                    .bucket(bucket)
+                    .bucket(&self.bucket)
                     .key(key)
                     .send()
                     .await?;

@@ -1,3 +1,4 @@
+.bail on
 .load ../target/debug/bottomless
 .open file:test.db?vfs=bottomless
 DROP TABLE IF EXISTS test;

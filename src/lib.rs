@@ -33,12 +33,8 @@ fn lockstr(lock: i32) -> &'static str {
 pub struct sqlite3_io_methods {
     iVersion: i32,
     xClose: unsafe extern "C" fn(file_ptr: *mut BottomlessFile) -> i32,
-    xRead: unsafe extern "C" fn(
-        file_ptr: *mut BottomlessFile,
-        buf: *mut c_void,
-        n: i32,
-        off: i64,
-    ) -> i32,
+    xRead:
+        unsafe extern "C" fn(file_ptr: *mut BottomlessFile, buf: *mut u8, n: i32, off: i64) -> i32,
     xWrite: unsafe extern "C" fn(
         file_ptr: *mut BottomlessFile,
         buf: *const u8,
@@ -141,18 +137,13 @@ fn native_handle(file_ptr: *mut BottomlessFile) -> *mut BottomlessFile {
 
 #[instrument(skip(file_ptr))]
 unsafe extern "C" fn xClose(file_ptr: *mut BottomlessFile) -> i32 {
-    info!("");
+    debug!("");
     ((*(*(*file_ptr).native_file).methods).xClose)(native_handle(file_ptr))
 }
 
 #[instrument(skip(file_ptr))]
-unsafe extern "C" fn xRead(
-    file_ptr: *mut BottomlessFile,
-    buf: *mut c_void,
-    n: i32,
-    off: i64,
-) -> i32 {
-    info!("reading {}:{}", off, n);
+unsafe extern "C" fn xRead(file_ptr: *mut BottomlessFile, buf: *mut u8, n: i32, off: i64) -> i32 {
+    debug!("reading {}:{}", off, n);
     ((*(*(*file_ptr).native_file).methods).xRead)(native_handle(file_ptr), buf, n, off)
 }
 
@@ -164,7 +155,7 @@ unsafe extern "C" fn xWrite(
     off: i64,
 ) -> i32 {
     let file = &mut *file_ptr;
-    info!("Writing {}:{} to {}", off, n, file.name);
+    debug!("Writing {}:{} to {}", off, n, file.name);
     let data = std::slice::from_raw_parts(buf, n as usize);
     file.replicator.as_mut().unwrap().write(off, data);
     ((*(*(*file_ptr).native_file).methods).xWrite)(native_handle(file_ptr), buf, n, off)
@@ -172,19 +163,19 @@ unsafe extern "C" fn xWrite(
 
 #[instrument(skip(file_ptr))]
 unsafe extern "C" fn xTruncate(file_ptr: *mut BottomlessFile, size: i64) -> i32 {
-    info!("");
+    debug!("");
     ((*(*(*file_ptr).native_file).methods).xTruncate)(native_handle(file_ptr), size)
 }
 
 #[instrument(skip(file_ptr))]
 unsafe extern "C" fn xSync(file_ptr: *mut BottomlessFile, flags: i32) -> i32 {
-    info!("");
+    debug!("");
     ((*(*(*file_ptr).native_file).methods).xSync)(native_handle(file_ptr), flags)
 }
 
 #[instrument(skip(file_ptr))]
 unsafe extern "C" fn xFileSize(file_ptr: *mut BottomlessFile, size: *mut i64) -> i32 {
-    info!("");
+    debug!("");
     ((*(*(*file_ptr).native_file).methods).xFileSize)(native_handle(file_ptr), size)
 }
 
@@ -192,23 +183,17 @@ unsafe extern "C" fn xFileSize(file_ptr: *mut BottomlessFile, size: *mut i64) ->
 unsafe extern "C" fn xLock(file_ptr: *mut BottomlessFile, lock: i32) -> i32 {
     let file = &mut *file_ptr;
     file.lock = lock;
-    info!("Lock: {} -> {}", lockstr(file.lock), lockstr(lock));
+    debug!("Lock: {} -> {}", lockstr(file.lock), lockstr(lock));
     ((*(*(*file_ptr).native_file).methods).xLock)(native_handle(file_ptr), lock)
 }
 
 #[instrument(skip(file_ptr))]
 unsafe extern "C" fn xUnlock(file_ptr: *mut BottomlessFile, lock: i32) -> i32 {
     let file = &mut *file_ptr;
-    info!("Unlock: {} -> {}", lockstr(file.lock), lockstr(lock));
+    debug!("Unlock: {} -> {}", lockstr(file.lock), lockstr(lock));
     if file.lock >= SQLITE_LOCK_RESERVED && lock < SQLITE_LOCK_RESERVED {
-        if let Err(e) = file
-            .replicator
-            .as_mut()
-            .unwrap()
-            .commit("libsql", &file.name)
-        {
+        if let Err(e) = file.replicator.as_mut().unwrap().commit() {
             error!("Commit replication failed: {}", e);
-            //TODO: perhaps it's better to write locally anyway
             return SQLITE_IOERR_UNLOCK;
         }
     }
@@ -217,25 +202,25 @@ unsafe extern "C" fn xUnlock(file_ptr: *mut BottomlessFile, lock: i32) -> i32 {
 
 #[instrument(skip(file_ptr))]
 unsafe extern "C" fn xCheckReservedLock(file_ptr: *mut BottomlessFile, res: *mut i32) -> i32 {
-    info!("");
+    debug!("");
     ((*(*(*file_ptr).native_file).methods).xCheckReservedLock)(native_handle(file_ptr), res)
 }
 
 #[instrument(skip(file_ptr))]
 unsafe extern "C" fn xFileControl(file_ptr: *mut BottomlessFile, op: i32, arg: *mut c_void) -> i32 {
-    info!("");
+    debug!("");
     ((*(*(*file_ptr).native_file).methods).xFileControl)(native_handle(file_ptr), op, arg)
 }
 
 #[instrument(skip(file_ptr))]
 unsafe extern "C" fn xSectorSize(file_ptr: *mut BottomlessFile) -> i32 {
-    info!("");
+    debug!("");
     ((*(*(*file_ptr).native_file).methods).xSectorSize)(native_handle(file_ptr))
 }
 
 #[instrument(skip(file_ptr))]
 unsafe extern "C" fn xDeviceCharacteristics(file_ptr: *mut BottomlessFile) -> i32 {
-    info!("");
+    debug!("");
     ((*(*(*file_ptr).native_file).methods).xDeviceCharacteristics)(native_handle(file_ptr))
 }
 
@@ -312,7 +297,7 @@ const BOTTOMLESS_METHODS: sqlite3_io_methods = sqlite3_io_methods {
 };
 
 fn get_base_vfs_ptr(vfs: *mut sqlite3_vfs) -> *mut sqlite3_vfs {
-    info!("base vfs: {:?}", unsafe {
+    debug!("base vfs: {:?}", unsafe {
         (*vfs).pData as *mut sqlite3_vfs
     });
     unsafe { (*vfs).pData as *mut sqlite3_vfs }
@@ -348,7 +333,7 @@ pub fn open_impl(
         None => name_str.to_string(),
     };
 
-    let replicator = match s3::Replicator::new() {
+    let replicator = match s3::Replicator::new(file.name.clone()) {
         Ok(r) => r,
         Err(e) => {
             error!("Replicator init failed: {}", e);
@@ -373,13 +358,51 @@ pub fn open_impl(
         xFileSize(file as *mut BottomlessFile, &mut native_size as *mut i64);
     }
 
+    let initial_replication_policy = std::env::var("LIBSQL_BOTTOMLESS_INITIAL_REPLICATION")
+        .unwrap_or_default()
+        .to_lowercase();
+
     if native_size > 0 {
-        warn!(
-            "Database file not empty ({} pages), not bootstrapping!",
-            native_size / s3::Replicator::PAGE_SIZE as i64
-        );
+        if initial_replication_policy == "skip" {
+            warn!(
+                "Database file not empty ({} pages), not bootstrapping!",
+                native_size / s3::Replicator::PAGE_SIZE as i64
+            );
+        } else {
+            let replicator = file.replicator.as_mut().unwrap();
+            if !replicator.is_bucket_empty() && initial_replication_policy != "force" {
+                error!("Refusing to replicate to non-empty bucket {}. Set LIBSQL_BOTTOMLESS_INITIAL_REPLICATION=force if you wish to try anyway", replicator.bucket);
+                return SQLITE_CANTOPEN;
+            }
+            info!(
+                "Initial replication to bucket {} initiated",
+                replicator.bucket
+            );
+            for offset in (0..native_size).step_by(s3::Replicator::PAGE_SIZE) {
+                let pgno = offset / s3::Replicator::PAGE_SIZE as i64 + 1;
+                info!("Replicating page {}", pgno);
+                let mut page_buf = [0_u8; s3::Replicator::PAGE_SIZE];
+                unsafe {
+                    let rc = ((*(*file.native_file).methods).xRead)(
+                        file.native_file as *mut BottomlessFile,
+                        page_buf.as_mut_ptr(),
+                        s3::Replicator::PAGE_SIZE as i32,
+                        offset as i64,
+                    );
+                    debug!("\tRead status: {}", rc);
+                    if rc != SQLITE_OK {
+                        error!("Failed to read page {} during remote bootstrap", pgno);
+                        return SQLITE_CANTOPEN;
+                    }
+                }
+                replicator.write(offset, &page_buf);
+            }
+            if let Err(e) = replicator.commit() {
+                error!("Initial replication failed: {}", e);
+            }
+        }
     } else {
-        let pages = match file.replicator.as_mut().unwrap().boot("libsql") {
+        let pages = match file.replicator.as_mut().unwrap().boot() {
             Ok(pages) => pages,
             Err(e) => {
                 error!("Bootstrapping from the replicator failed: {}", e);
@@ -387,7 +410,7 @@ pub fn open_impl(
             }
         };
         for (pgno, data) in pages {
-            info!("Writting page {} from the replicator locally", pgno);
+            debug!("Writting page {} from the replicator locally", pgno);
             unsafe {
                 let rc = ((*(*file.native_file).methods).xWrite)(
                     file.native_file as *mut BottomlessFile,
@@ -395,7 +418,7 @@ pub fn open_impl(
                     s3::Replicator::PAGE_SIZE as i32,
                     pgno as i64 * s3::Replicator::PAGE_SIZE as i64,
                 );
-                info!("Write status: {}", rc);
+                debug!("\tWrite status: {}", rc);
                 if rc != SQLITE_OK {
                     error!("Failed to apply page {} during remote bootstrap", pgno);
                     return SQLITE_CANTOPEN;
@@ -410,7 +433,7 @@ pub fn open_impl(
 #[no_mangle]
 pub fn bottomless_init() {
     tracing_subscriber::fmt::init();
-    info!("init");
+    debug!("init");
 }
 
 #[no_mangle]
