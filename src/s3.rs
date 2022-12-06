@@ -2,7 +2,6 @@ use aws_sdk_s3::types::ByteStream;
 use aws_sdk_s3::{Client, Endpoint};
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
-use tokio::runtime::{Builder, Runtime};
 use tracing::{debug, error, info};
 
 pub type Result<T> = anyhow::Result<T>;
@@ -11,7 +10,7 @@ pub type Result<T> = anyhow::Result<T>;
 pub struct Replicator {
     client: Client,
     write_buffer: HashMap<i64, BytesMut>,
-    runtime: Runtime,
+    runtime: tokio::runtime::Runtime,
 
     pub(crate) bucket: String,
     pub(crate) db_name: String,
@@ -27,7 +26,9 @@ impl Replicator {
     pub const PAGE_SIZE: usize = 4096;
 
     pub fn new(db_name: impl Into<String>) -> Result<Self> {
-        let runtime = Builder::new_current_thread().enable_all().build()?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
         let write_buffer = HashMap::new();
         let endpoint = std::env::var("LIBSQL_BOTTOMLESS_ENDPOINT")
             .unwrap_or_else(|_| "http://localhost:9000".to_string());

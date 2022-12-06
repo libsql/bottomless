@@ -4,9 +4,9 @@ SQLITE_EXTENSION_INIT1
 #include <stdio.h>
 
 struct BottomlessFile {
-  sqlite3_file base;        /* Subclass.  MUST BE FIRST! */
-  sqlite3_file *native;
-  char pad[4096];            /* Private, used in Rustv*/
+  sqlite3_file base;        /* Subclass.  MUST BE FIRST!  */
+  sqlite3_file *native;     /* Underlying vfs file        */
+  char pad[8192];           /* Private, used by Rust code */
 };
 
 extern void bottomless_init();

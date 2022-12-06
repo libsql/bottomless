@@ -137,7 +137,7 @@ fn native_handle(file_ptr: *mut BottomlessFile) -> *mut BottomlessFile {
 
 #[instrument(skip(file_ptr))]
 unsafe extern "C" fn xClose(file_ptr: *mut BottomlessFile) -> i32 {
-    debug!("");
+    debug!("closing");
     ((*(*(*file_ptr).native_file).methods).xClose)(native_handle(file_ptr))
 }
 
@@ -163,19 +163,17 @@ unsafe extern "C" fn xWrite(
 
 #[instrument(skip(file_ptr))]
 unsafe extern "C" fn xTruncate(file_ptr: *mut BottomlessFile, size: i64) -> i32 {
-    debug!("");
+    debug!("truncating");
     ((*(*(*file_ptr).native_file).methods).xTruncate)(native_handle(file_ptr), size)
 }
 
 #[instrument(skip(file_ptr))]
 unsafe extern "C" fn xSync(file_ptr: *mut BottomlessFile, flags: i32) -> i32 {
-    debug!("");
+    debug!("sync");
     ((*(*(*file_ptr).native_file).methods).xSync)(native_handle(file_ptr), flags)
 }
 
-#[instrument(skip(file_ptr))]
 unsafe extern "C" fn xFileSize(file_ptr: *mut BottomlessFile, size: *mut i64) -> i32 {
-    debug!("");
     ((*(*(*file_ptr).native_file).methods).xFileSize)(native_handle(file_ptr), size)
 }
 
@@ -200,27 +198,19 @@ unsafe extern "C" fn xUnlock(file_ptr: *mut BottomlessFile, lock: i32) -> i32 {
     ((*(*(*file_ptr).native_file).methods).xUnlock)(native_handle(file_ptr), lock)
 }
 
-#[instrument(skip(file_ptr))]
 unsafe extern "C" fn xCheckReservedLock(file_ptr: *mut BottomlessFile, res: *mut i32) -> i32 {
-    debug!("");
     ((*(*(*file_ptr).native_file).methods).xCheckReservedLock)(native_handle(file_ptr), res)
 }
 
-#[instrument(skip(file_ptr))]
 unsafe extern "C" fn xFileControl(file_ptr: *mut BottomlessFile, op: i32, arg: *mut c_void) -> i32 {
-    debug!("");
     ((*(*(*file_ptr).native_file).methods).xFileControl)(native_handle(file_ptr), op, arg)
 }
 
-#[instrument(skip(file_ptr))]
 unsafe extern "C" fn xSectorSize(file_ptr: *mut BottomlessFile) -> i32 {
-    debug!("");
     ((*(*(*file_ptr).native_file).methods).xSectorSize)(native_handle(file_ptr))
 }
 
-#[instrument(skip(file_ptr))]
 unsafe extern "C" fn xDeviceCharacteristics(file_ptr: *mut BottomlessFile) -> i32 {
-    debug!("");
     ((*(*(*file_ptr).native_file).methods).xDeviceCharacteristics)(native_handle(file_ptr))
 }
 
@@ -310,7 +300,7 @@ fn get_base_vfs_ptr(vfs: *mut sqlite3_vfs) -> *mut sqlite3_vfs {
 #[no_mangle]
 pub fn bottomless_init() {
     tracing_subscriber::fmt::init();
-    debug!("init");
+    debug!("bottomless module initialized");
 }
 
 // VFS Methods
@@ -455,7 +445,6 @@ pub fn xOpen(
 }
 
 #[no_mangle]
-#[instrument]
 pub fn xDelete(vfs: *mut sqlite3_vfs, name: *const i8, sync_dir: i32) -> i32 {
     let base_vfs_ptr = get_base_vfs_ptr(vfs);
     let base_vfs: &mut sqlite3_vfs = unsafe { &mut *base_vfs_ptr };
@@ -463,7 +452,6 @@ pub fn xDelete(vfs: *mut sqlite3_vfs, name: *const i8, sync_dir: i32) -> i32 {
 }
 
 #[no_mangle]
-#[instrument]
 pub fn xAccess(vfs: *mut sqlite3_vfs, name: *const i8, flags: i32, res: *mut i32) -> i32 {
     let base_vfs_ptr = get_base_vfs_ptr(vfs);
     let base_vfs: &mut sqlite3_vfs = unsafe { &mut *base_vfs_ptr };
@@ -471,7 +459,6 @@ pub fn xAccess(vfs: *mut sqlite3_vfs, name: *const i8, flags: i32, res: *mut i32
 }
 
 #[no_mangle]
-#[instrument]
 pub fn xFullPathname(vfs: *mut sqlite3_vfs, name: *const i8, n: i32, out: *mut i8) -> i32 {
     let base_vfs_ptr = get_base_vfs_ptr(vfs);
     let base_vfs: &mut sqlite3_vfs = unsafe { &mut *base_vfs_ptr };
@@ -481,7 +468,6 @@ pub fn xFullPathname(vfs: *mut sqlite3_vfs, name: *const i8, n: i32, out: *mut i
 }
 
 #[no_mangle]
-#[instrument]
 pub fn xDlOpen(vfs: *mut sqlite3_vfs, name: *const i8) -> *const c_void {
     let base_vfs_ptr = get_base_vfs_ptr(vfs);
     let base_vfs: &mut sqlite3_vfs = unsafe { &mut *base_vfs_ptr };
@@ -489,7 +475,6 @@ pub fn xDlOpen(vfs: *mut sqlite3_vfs, name: *const i8) -> *const c_void {
 }
 
 #[no_mangle]
-#[instrument]
 pub fn xDlError(vfs: *mut sqlite3_vfs, n: i32, msg: *mut u8) {
     let base_vfs_ptr = get_base_vfs_ptr(vfs);
     let base_vfs: &mut sqlite3_vfs = unsafe { &mut *base_vfs_ptr };
@@ -497,7 +482,6 @@ pub fn xDlError(vfs: *mut sqlite3_vfs, n: i32, msg: *mut u8) {
 }
 
 #[no_mangle]
-#[instrument]
 pub fn xDlSym(
     vfs: *mut sqlite3_vfs,
     arg: *mut c_void,
@@ -509,7 +493,6 @@ pub fn xDlSym(
 }
 
 #[no_mangle]
-#[instrument]
 pub fn xDlClose(vfs: *mut sqlite3_vfs, arg: *mut c_void) {
     let base_vfs_ptr = get_base_vfs_ptr(vfs);
     let base_vfs: &mut sqlite3_vfs = unsafe { &mut *base_vfs_ptr };
@@ -517,7 +500,6 @@ pub fn xDlClose(vfs: *mut sqlite3_vfs, arg: *mut c_void) {
 }
 
 #[no_mangle]
-#[instrument]
 pub fn xRandomness(vfs: *mut sqlite3_vfs, n_bytes: i32, out: *mut u8) -> i32 {
     let base_vfs_ptr = get_base_vfs_ptr(vfs);
     let base_vfs: &mut sqlite3_vfs = unsafe { &mut *base_vfs_ptr };
@@ -525,7 +507,6 @@ pub fn xRandomness(vfs: *mut sqlite3_vfs, n_bytes: i32, out: *mut u8) -> i32 {
 }
 
 #[no_mangle]
-#[instrument]
 pub fn xSleep(vfs: *mut sqlite3_vfs, ms: i32) -> i32 {
     let base_vfs_ptr = get_base_vfs_ptr(vfs);
     let base_vfs: &mut sqlite3_vfs = unsafe { &mut *base_vfs_ptr };
@@ -533,7 +514,6 @@ pub fn xSleep(vfs: *mut sqlite3_vfs, ms: i32) -> i32 {
 }
 
 #[no_mangle]
-#[instrument]
 pub fn xCurrentTime(vfs: *mut sqlite3_vfs, time: *mut f64) -> i32 {
     let base_vfs_ptr = get_base_vfs_ptr(vfs);
     let base_vfs: &mut sqlite3_vfs = unsafe { &mut *base_vfs_ptr };
@@ -541,7 +521,6 @@ pub fn xCurrentTime(vfs: *mut sqlite3_vfs, time: *mut f64) -> i32 {
 }
 
 #[no_mangle]
-#[instrument]
 pub fn xGetLastError(vfs: *mut sqlite3_vfs, n: i32, buf: *mut u8) -> i32 {
     let base_vfs_ptr = get_base_vfs_ptr(vfs);
     let base_vfs: &mut sqlite3_vfs = unsafe { &mut *base_vfs_ptr };
@@ -549,7 +528,6 @@ pub fn xGetLastError(vfs: *mut sqlite3_vfs, n: i32, buf: *mut u8) -> i32 {
 }
 
 #[no_mangle]
-#[instrument]
 pub fn xCurrentTimeInt64(vfs: *mut sqlite3_vfs, time: *mut i64) -> i32 {
     let base_vfs_ptr = get_base_vfs_ptr(vfs);
     let base_vfs: &mut sqlite3_vfs = unsafe { &mut *base_vfs_ptr };
