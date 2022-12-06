@@ -51,7 +51,7 @@ pub struct sqlite3_io_methods {
         unsafe extern "C" fn(file_ptr: *mut BottomlessFile, op: i32, arg: *mut c_void) -> i32,
     xSectorSize: unsafe extern "C" fn(file_ptr: *mut BottomlessFile) -> i32,
     xDeviceCharacteristics: unsafe extern "C" fn(file_ptr: *mut BottomlessFile) -> i32,
-    // v2
+    /* v2
     xShmMap: unsafe extern "C" fn(
         file_ptr: *mut BottomlessFile,
         pgno: i32,
@@ -72,6 +72,7 @@ pub struct sqlite3_io_methods {
     ) -> i32,
     xUnfetch:
         unsafe extern "C" fn(file_ptr: *mut BottomlessFile, off: i64, addr: *mut c_void) -> i32,
+    */
 }
 
 #[repr(C)]
@@ -223,6 +224,7 @@ unsafe extern "C" fn xDeviceCharacteristics(file_ptr: *mut BottomlessFile) -> i3
     ((*(*(*file_ptr).native_file).methods).xDeviceCharacteristics)(native_handle(file_ptr))
 }
 
+/* v2
 #[instrument]
 unsafe extern "C" fn xShmMap(
     _file_ptr: *mut BottomlessFile,
@@ -272,9 +274,10 @@ unsafe extern "C" fn xUnfetch(
 ) -> i32 {
     unimplemented!()
 }
+*/
 
 const BOTTOMLESS_METHODS: sqlite3_io_methods = sqlite3_io_methods {
-    iVersion: 2,
+    iVersion: 1,
     xClose,
     xRead,
     xWrite,
@@ -287,12 +290,14 @@ const BOTTOMLESS_METHODS: sqlite3_io_methods = sqlite3_io_methods {
     xFileControl,
     xSectorSize,
     xDeviceCharacteristics,
+    /* v2
     xShmMap,
     xShmLock,
     xShmBarrier,
     xShmUnmap,
     xFetch,
     xUnfetch,
+    */
 };
 
 fn get_base_vfs_ptr(vfs: *mut sqlite3_vfs) -> *mut sqlite3_vfs {
@@ -302,10 +307,16 @@ fn get_base_vfs_ptr(vfs: *mut sqlite3_vfs) -> *mut sqlite3_vfs {
     unsafe { (*vfs).pData as *mut sqlite3_vfs }
 }
 
+#[no_mangle]
+pub fn bottomless_init() {
+    tracing_subscriber::fmt::init();
+    debug!("init");
+}
+
 // VFS Methods
 #[no_mangle]
 #[instrument(skip(vfs, name, file, out_flags))]
-pub fn open_impl(
+pub fn xOpen(
     vfs: *mut sqlite3_vfs,
     name: *const i8,
     file: *mut sqlite3_file,
@@ -437,14 +448,8 @@ pub fn open_impl(
 }
 
 #[no_mangle]
-pub fn bottomless_init() {
-    tracing_subscriber::fmt::init();
-    debug!("init");
-}
-
-#[no_mangle]
 #[instrument]
-pub fn delete_impl(vfs: *mut sqlite3_vfs, name: *const i8, sync_dir: i32) -> i32 {
+pub fn xDelete(vfs: *mut sqlite3_vfs, name: *const i8, sync_dir: i32) -> i32 {
     let base_vfs_ptr = get_base_vfs_ptr(vfs);
     let base_vfs: &mut sqlite3_vfs = unsafe { &mut *base_vfs_ptr };
     unsafe { (base_vfs.xDelete)(base_vfs_ptr, name, sync_dir) }
@@ -452,7 +457,7 @@ pub fn delete_impl(vfs: *mut sqlite3_vfs, name: *const i8, sync_dir: i32) -> i32
 
 #[no_mangle]
 #[instrument]
-pub fn access_impl(vfs: *mut sqlite3_vfs, name: *const i8, flags: i32, res: *mut i32) -> i32 {
+pub fn xAccess(vfs: *mut sqlite3_vfs, name: *const i8, flags: i32, res: *mut i32) -> i32 {
     let base_vfs_ptr = get_base_vfs_ptr(vfs);
     let base_vfs: &mut sqlite3_vfs = unsafe { &mut *base_vfs_ptr };
     unsafe { (base_vfs.xAccess)(base_vfs_ptr, name, flags, res) }
@@ -460,7 +465,7 @@ pub fn access_impl(vfs: *mut sqlite3_vfs, name: *const i8, flags: i32, res: *mut
 
 #[no_mangle]
 #[instrument]
-pub fn full_pathname_impl(vfs: *mut sqlite3_vfs, name: *const i8, n: i32, out: *mut i8) -> i32 {
+pub fn xFullPathname(vfs: *mut sqlite3_vfs, name: *const i8, n: i32, out: *mut i8) -> i32 {
     let base_vfs_ptr = get_base_vfs_ptr(vfs);
     let base_vfs: &mut sqlite3_vfs = unsafe { &mut *base_vfs_ptr };
     unsafe { (base_vfs.xFullPathname)(base_vfs_ptr, name, n, out) };
@@ -470,7 +475,7 @@ pub fn full_pathname_impl(vfs: *mut sqlite3_vfs, name: *const i8, n: i32, out: *
 
 #[no_mangle]
 #[instrument]
-pub fn dl_open_impl(vfs: *mut sqlite3_vfs, name: *const i8) -> *const c_void {
+pub fn xDlOpen(vfs: *mut sqlite3_vfs, name: *const i8) -> *const c_void {
     let base_vfs_ptr = get_base_vfs_ptr(vfs);
     let base_vfs: &mut sqlite3_vfs = unsafe { &mut *base_vfs_ptr };
     unsafe { (base_vfs.xDlOpen)(base_vfs_ptr, name) }
@@ -478,7 +483,7 @@ pub fn dl_open_impl(vfs: *mut sqlite3_vfs, name: *const i8) -> *const c_void {
 
 #[no_mangle]
 #[instrument]
-pub fn dl_error_impl(vfs: *mut sqlite3_vfs, n: i32, msg: *mut u8) {
+pub fn xDlError(vfs: *mut sqlite3_vfs, n: i32, msg: *mut u8) {
     let base_vfs_ptr = get_base_vfs_ptr(vfs);
     let base_vfs: &mut sqlite3_vfs = unsafe { &mut *base_vfs_ptr };
     unsafe { (base_vfs.xDlError)(base_vfs_ptr, n, msg) }
@@ -486,7 +491,7 @@ pub fn dl_error_impl(vfs: *mut sqlite3_vfs, n: i32, msg: *mut u8) {
 
 #[no_mangle]
 #[instrument]
-pub fn dl_sym_impl(
+pub fn xDlSym(
     vfs: *mut sqlite3_vfs,
     arg: *mut c_void,
     symbol: *const u8,
@@ -498,7 +503,7 @@ pub fn dl_sym_impl(
 
 #[no_mangle]
 #[instrument]
-pub fn dl_close_impl(vfs: *mut sqlite3_vfs, arg: *mut c_void) {
+pub fn xDlClose(vfs: *mut sqlite3_vfs, arg: *mut c_void) {
     let base_vfs_ptr = get_base_vfs_ptr(vfs);
     let base_vfs: &mut sqlite3_vfs = unsafe { &mut *base_vfs_ptr };
     unsafe { (base_vfs.xDlClose)(base_vfs_ptr, arg) }
@@ -506,7 +511,7 @@ pub fn dl_close_impl(vfs: *mut sqlite3_vfs, arg: *mut c_void) {
 
 #[no_mangle]
 #[instrument]
-pub fn randomness_impl(vfs: *mut sqlite3_vfs, n_bytes: i32, out: *mut u8) -> i32 {
+pub fn xRandomness(vfs: *mut sqlite3_vfs, n_bytes: i32, out: *mut u8) -> i32 {
     let base_vfs_ptr = get_base_vfs_ptr(vfs);
     let base_vfs: &mut sqlite3_vfs = unsafe { &mut *base_vfs_ptr };
     unsafe { (base_vfs.xRandomness)(base_vfs_ptr, n_bytes, out) }
@@ -514,7 +519,7 @@ pub fn randomness_impl(vfs: *mut sqlite3_vfs, n_bytes: i32, out: *mut u8) -> i32
 
 #[no_mangle]
 #[instrument]
-pub fn sleep_impl(vfs: *mut sqlite3_vfs, ms: i32) -> i32 {
+pub fn xSleep(vfs: *mut sqlite3_vfs, ms: i32) -> i32 {
     let base_vfs_ptr = get_base_vfs_ptr(vfs);
     let base_vfs: &mut sqlite3_vfs = unsafe { &mut *base_vfs_ptr };
     unsafe { (base_vfs.xSleep)(base_vfs_ptr, ms) }
@@ -522,7 +527,7 @@ pub fn sleep_impl(vfs: *mut sqlite3_vfs, ms: i32) -> i32 {
 
 #[no_mangle]
 #[instrument]
-pub fn current_time_impl(vfs: *mut sqlite3_vfs, time: *mut f64) -> i32 {
+pub fn xCurrentTime(vfs: *mut sqlite3_vfs, time: *mut f64) -> i32 {
     let base_vfs_ptr = get_base_vfs_ptr(vfs);
     let base_vfs: &mut sqlite3_vfs = unsafe { &mut *base_vfs_ptr };
     unsafe { (base_vfs.xCurrentTime)(base_vfs_ptr, time) }
@@ -530,7 +535,7 @@ pub fn current_time_impl(vfs: *mut sqlite3_vfs, time: *mut f64) -> i32 {
 
 #[no_mangle]
 #[instrument]
-pub fn get_last_error_impl(vfs: *mut sqlite3_vfs, n: i32, buf: *mut u8) -> i32 {
+pub fn xGetLastError(vfs: *mut sqlite3_vfs, n: i32, buf: *mut u8) -> i32 {
     let base_vfs_ptr = get_base_vfs_ptr(vfs);
     let base_vfs: &mut sqlite3_vfs = unsafe { &mut *base_vfs_ptr };
     unsafe { (base_vfs.xGetLastError)(base_vfs_ptr, n, buf) }
@@ -538,7 +543,7 @@ pub fn get_last_error_impl(vfs: *mut sqlite3_vfs, n: i32, buf: *mut u8) -> i32 {
 
 #[no_mangle]
 #[instrument]
-pub fn current_time_int64_impl(vfs: *mut sqlite3_vfs, time: *mut i64) -> i32 {
+pub fn xCurrentTimeInt64(vfs: *mut sqlite3_vfs, time: *mut i64) -> i32 {
     let base_vfs_ptr = get_base_vfs_ptr(vfs);
     let base_vfs: &mut sqlite3_vfs = unsafe { &mut *base_vfs_ptr };
     unsafe { (base_vfs.xCurrentTimeInt64)(base_vfs_ptr, time) }

@@ -9,48 +9,25 @@ struct BottomlessFile {
   char pad[4096];            /* Private, used in Rustv*/
 };
 
-/*
-struct sqlite3_vfs {
-  int iVersion;
-  int szOsFile;
-  int mxPathname;
-  sqlite3_vfs *pNext;
-  const char *zName;
-  void *pAppData;
-  int (*xOpen)(sqlite3_vfs*, sqlite3_filename zName, sqlite3_file*,
-               int flags, int *pOutFlags);
-  int (*xDelete)(sqlite3_vfs*, const char *zName, int syncDir);
-  int (*xAccess)(sqlite3_vfs*, const char *zName, int flags, int *pResOut);
-  int (*xFullPathname)(sqlite3_vfs*, const char *zName, int nOut, char *zOut);
-  void *(*xDlOpen)(sqlite3_vfs*, const char *zFilename);
-  void (*xDlError)(sqlite3_vfs*, int nByte, char *zErrMsg);
-  void (*(*xDlSym)(sqlite3_vfs*,void*, const char *zSymbol))(void);
-  void (*xDlClose)(sqlite3_vfs*, void*);
-  int (*xRandomness)(sqlite3_vfs*, int nByte, char *zOut);
-  int (*xSleep)(sqlite3_vfs*, int microseconds);
-  int (*xCurrentTime)(sqlite3_vfs*, double*);
-  int (*xGetLastError)(sqlite3_vfs*, int, char *);
-  int (*xCurrentTimeInt64)(sqlite3_vfs*, sqlite3_int64*);
-};
-*/
-
 extern void bottomless_init();
-extern int open_impl(sqlite3_vfs*, const char *zName, sqlite3_file*,
+extern int xOpen(sqlite3_vfs*, const char *zName, sqlite3_file*,
                int flags, int *pOutFlags);
-extern int delete_impl(sqlite3_vfs*, const char *zName, int syncDir);
-extern int access_impl(sqlite3_vfs*, const char *zName, int flags, int *pResOut);
-extern int full_pathname_impl(sqlite3_vfs*, const char *zName, int nOut, char *zOut);
-extern void *dl_open_impl(sqlite3_vfs*, const char *zFilename);
-extern void  dl_error_impl(sqlite3_vfs*, int nByte, char *zErrMsg);
-extern void (*(*dl_sym_impl)(sqlite3_vfs*,void*, const char *zSymbol))(void);
-extern  void dl_close_impl(sqlite3_vfs*, void*);
-extern  int randomness_impl(sqlite3_vfs*, int nByte, char *zOut);
-extern  int sleep_impl(sqlite3_vfs*, int microseconds);
-extern  int current_time_impl(sqlite3_vfs*, double*);
-extern  int get_last_error_impl(sqlite3_vfs*, int, char *);
-extern  int current_time_int64_impl(sqlite3_vfs*, sqlite3_int64*);
+extern int xDelete(sqlite3_vfs*, const char *zName, int syncDir);
+extern int xAccess(sqlite3_vfs*, const char *zName, int flags, int *pResOut);
+extern int xFullPathname(sqlite3_vfs*, const char *zName, int nOut, char *zOut);
+extern void *xDlOpen(sqlite3_vfs*, const char *zFilename);
+extern void  xDlError(sqlite3_vfs*, int nByte, char *zErrMsg);
+extern void (*(*xDlSym)(sqlite3_vfs*,void*, const char *zSymbol))(void);
+extern  void xDlClose(sqlite3_vfs*, void*);
+extern  int xRandomness(sqlite3_vfs*, int nByte, char *zOut);
+extern  int xSleep(sqlite3_vfs*, int microseconds);
+extern  int xCurrentTime(sqlite3_vfs*, double*);
+extern  int xGetLastError(sqlite3_vfs*, int, char *);
+extern  int xCurrentTimeInt64(sqlite3_vfs*, sqlite3_int64*);
 
 static sqlite3_vfs bottomless_vfs;
+
+#define BOTTOMLESS_ASSIGN(x) (bottomless_vfs.x = x);
 
 int sqlite3_extension_init(
   sqlite3 *db, 
@@ -74,19 +51,19 @@ int sqlite3_extension_init(
   bottomless_vfs.pAppData = orig;
   bottomless_vfs.szOsFile = sizeof(struct BottomlessFile);
 
-  bottomless_vfs.xOpen = open_impl;
-  bottomless_vfs.xDelete = delete_impl;
-  bottomless_vfs.xAccess = access_impl;
-  bottomless_vfs.xFullPathname = full_pathname_impl;
-  bottomless_vfs.xDlOpen = dl_open_impl;
-  bottomless_vfs.xDlError = dl_error_impl;
-  bottomless_vfs.xDlSym = dl_sym_impl;
-  bottomless_vfs.xDlClose = dl_close_impl;
-  bottomless_vfs.xRandomness = randomness_impl;
-  bottomless_vfs.xSleep = sleep_impl;
-  bottomless_vfs.xCurrentTime = current_time_impl;
-  bottomless_vfs.xGetLastError = get_last_error_impl;
-  bottomless_vfs.xCurrentTimeInt64 = current_time_int64_impl;
+  BOTTOMLESS_ASSIGN(xOpen);
+  BOTTOMLESS_ASSIGN(xDelete);
+  BOTTOMLESS_ASSIGN(xAccess);
+  BOTTOMLESS_ASSIGN(xFullPathname);
+  BOTTOMLESS_ASSIGN(xDlOpen);
+  BOTTOMLESS_ASSIGN(xDlError);
+  BOTTOMLESS_ASSIGN(xDlSym);
+  BOTTOMLESS_ASSIGN(xDlClose);
+  BOTTOMLESS_ASSIGN(xRandomness);
+  BOTTOMLESS_ASSIGN(xSleep);
+  BOTTOMLESS_ASSIGN(xCurrentTime);
+  BOTTOMLESS_ASSIGN(xGetLastError);
+  BOTTOMLESS_ASSIGN(xCurrentTimeInt64);
 
   rc = sqlite3_vfs_register(&bottomless_vfs, 0);
   return rc == SQLITE_OK ? SQLITE_OK_LOAD_PERMANENTLY : rc;
