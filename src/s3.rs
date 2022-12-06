@@ -3,7 +3,7 @@ use aws_sdk_s3::{Client, Endpoint};
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use tokio::runtime::{Builder, Runtime};
-use tracing::{error, info, trace};
+use tracing::{debug, error, info};
 
 pub type Result<T> = anyhow::Result<T>;
 
@@ -15,6 +15,12 @@ pub struct Replicator {
 
     pub(crate) bucket: String,
     pub(crate) db_name: String,
+}
+
+#[derive(Debug)]
+pub struct FetchedResults {
+    pub pages: Vec<(i32, Bytes)>,
+    pub next_marker: Option<String>,
 }
 
 impl Replicator {
@@ -96,56 +102,56 @@ impl Replicator {
             .unwrap_or(false)
     }
 
-    pub fn boot(&self) -> Result<Vec<(i32, Bytes)>> {
-        info!("Bootstrapping");
+    pub fn boot(&self, next_marker: Option<String>) -> Result<FetchedResults> {
+        debug!("Bootstrapping from offset {:?}", next_marker);
         self.runtime.block_on(async {
-            //FIXME: Vec is a stretch for large databases, boot should be paged as well
-            // and return an iterator
             let mut pages = Vec::new();
-            let mut next_marker: Option<String> = None;
-            loop {
-                trace!("Next marker: {:#?}", next_marker);
-                let mut list_request = self.client.list_objects().bucket(&self.bucket);
-                if let Some(marker) = next_marker {
-                    list_request = list_request.marker(marker);
+
+            let mut list_request = self.client.list_objects().bucket(&self.bucket).max_keys(2);
+            if let Some(marker) = next_marker {
+                list_request = list_request.marker(marker);
+            }
+            let response = list_request.send().await?;
+            let objs = match response.contents() {
+                Some(objs) => objs,
+                None => {
+                    return Ok(FetchedResults {
+                        pages,
+                        next_marker: None,
+                    })
                 }
-                let response = list_request.send().await?;
-                let objs = match response.contents() {
-                    Some(objs) => objs,
-                    None => return Ok(pages),
-                };
-                for obj in objs {
-                    let key = obj
-                        .key()
-                        .ok_or_else(|| anyhow::anyhow!("Failed to get key for an object"))?;
-                    info!("Object {}", key);
-                    let page = self
-                        .client
-                        .get_object()
-                        .bucket(&self.bucket)
-                        .key(key)
-                        .send()
-                        .await?;
-                    // Format: <db-name>-<page-no>
-                    match key
-                        .rfind('-')
-                        .map(|index| key[index + 1..].parse::<i32>().ok())
-                    {
-                        Some(Some(pgno)) => {
-                            let data = page.body.collect().await.map(|data| data.into_bytes())?;
-                            pages.push((pgno, data));
-                        }
-                        _ => error!("Failed to parse page number from key {}", key),
+            };
+            for obj in objs {
+                let key = obj
+                    .key()
+                    .ok_or_else(|| anyhow::anyhow!("Failed to get key for an object"))?;
+                info!("Object {}", key);
+                let page = self
+                    .client
+                    .get_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .send()
+                    .await?;
+                // Format: <db-name>-<page-no>
+                match key
+                    .rfind('-')
+                    .map(|index| key[index + 1..].parse::<i32>().ok())
+                {
+                    Some(Some(pgno)) => {
+                        let data = page.body.collect().await.map(|data| data.into_bytes())?;
+                        pages.push((pgno, data));
                     }
-                }
-                if response.is_truncated() {
-                    // unwrapping, key existence was validated in the loop above
-                    next_marker = objs.last().map(|elem| elem.key().unwrap().to_string());
-                } else {
-                    break;
+                    _ => error!("Failed to parse page number from key {}", key),
                 }
             }
-            Ok(pages)
+            Ok(FetchedResults {
+                pages,
+                next_marker: response
+                    .is_truncated()
+                    .then(|| objs.last().map(|elem| elem.key().unwrap().to_string()))
+                    .flatten(),
+            })
         })
     }
 }
