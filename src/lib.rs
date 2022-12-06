@@ -380,7 +380,14 @@ pub fn xOpen(
             );
         } else {
             let replicator = file.replicator.as_mut().unwrap();
-            if !replicator.is_bucket_empty() && initial_replication_policy != "force" {
+            let bucket_empty = match replicator.is_bucket_empty() {
+                Ok(empty) => empty,
+                Err(e) => {
+                    error!("Failed to check if the bucket is empty: {}", e);
+                    return SQLITE_CANTOPEN;
+                }
+            };
+            if !bucket_empty && initial_replication_policy != "force" {
                 error!("Refusing to replicate to non-empty bucket {}. Set LIBSQL_BOTTOMLESS_INITIAL_REPLICATION=force if you wish to try anyway", replicator.bucket);
                 return SQLITE_CANTOPEN;
             }

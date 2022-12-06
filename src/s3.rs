@@ -85,21 +85,19 @@ impl Replicator {
         Ok(())
     }
 
-    pub fn is_bucket_empty(&self) -> bool {
-        self.runtime
-            .block_on(async {
-                let objs = self
-                    .client
-                    .list_objects()
-                    .bucket(&self.bucket)
-                    .send()
-                    .await?;
-                match objs.contents() {
-                    Some(objs) => Ok::<bool, anyhow::Error>(objs.is_empty()),
-                    None => Ok::<bool, anyhow::Error>(true),
-                }
-            })
-            .unwrap_or(false)
+    pub fn is_bucket_empty(&self) -> Result<bool> {
+        self.runtime.block_on(async {
+            let objs = self
+                .client
+                .list_objects()
+                .bucket(&self.bucket)
+                .send()
+                .await?;
+            match objs.contents() {
+                Some(objs) => Ok::<bool, anyhow::Error>(objs.is_empty()),
+                None => Ok::<bool, anyhow::Error>(true),
+            }
+        })
     }
 
     pub fn boot(&self, next_marker: Option<String>) -> Result<FetchedResults> {
