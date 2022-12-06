@@ -7,9 +7,9 @@ make
 ```
 will produce a loadable `.so` libSQL/SQLite extension with bottomless VFS.
 ```
-make debug
+make release
 ```
-will do the same, but for debug mode.
+will do the same, but for release mode.
 
 ## Configuration
 By default, the S3 storage is expected to be available at `http://localhost:9000` (e.g. a local development [minio](https://min.io) server), and the auth information is extracted via regular S3 SDK mechanisms, i.e. environment variables and `~/.aws/credentials` file, if present. Ref: https://docs.aws.amazon.com/sdk-for-php/v3/developer-guide/guide_credentials_environment.html
@@ -19,7 +19,10 @@ Default endpoint can be overridden by an environment variable too, and in the fu
 export LIBSQL_BOTTOMLESS_ENDPOINT='http://localhost:9042'
 ```
 
-Buckets are not configurable yet.
+Bucket used for replication can be configured with:
+```
+export LIBSQL_BOTTOMLESS_BUCKET='http://localhost:9042'
+```
 
 ## How to use
 From libSQL/SQLite shell, load the extension and open a database file with `bottomless` VFS, e.g.:
@@ -34,6 +37,25 @@ A short demo script is available in the `test/` directory. It assumes that a loc
 ```sh
 cd test
 ./smoke_test.sh
+```
+
+## Initial replication
+Once the bottomless module is loaded, it will try to replicate the database file to S3, if the database file is not empty.
+However, if the target bucket is also non-empty, there's a potential conflict.
+
+The default behavior is to error out in this case, however there are two alternatives:
+ - `force`
+    the initial replication is performed, possibly overwriting the contents of the target bucket
+ - `skip`
+    the initial replication is not performed, and the local database file is treated as the source of truth
+
+The initial replication policy can be set with the following environment variable:
+```
+LIBSQL_BOTTOMLESS_INITIAL_REPLICATION=force
+```
+or
+```
+LIBSQL_BOTTOMLESS_INITIAL_REPLICATION=skip
 ```
 
 ## Details
