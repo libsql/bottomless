@@ -16,14 +16,14 @@ extern int xDelete(sqlite3_vfs*, const char *zName, int syncDir);
 extern int xAccess(sqlite3_vfs*, const char *zName, int flags, int *pResOut);
 extern int xFullPathname(sqlite3_vfs*, const char *zName, int nOut, char *zOut);
 extern void *xDlOpen(sqlite3_vfs*, const char *zFilename);
-extern void  xDlError(sqlite3_vfs*, int nByte, char *zErrMsg);
+extern void xDlError(sqlite3_vfs*, int nByte, char *zErrMsg);
 extern void (*(*xDlSym)(sqlite3_vfs*,void*, const char *zSymbol))(void);
-extern  void xDlClose(sqlite3_vfs*, void*);
-extern  int xRandomness(sqlite3_vfs*, int nByte, char *zOut);
-extern  int xSleep(sqlite3_vfs*, int microseconds);
-extern  int xCurrentTime(sqlite3_vfs*, double*);
-extern  int xGetLastError(sqlite3_vfs*, int, char *);
-extern  int xCurrentTimeInt64(sqlite3_vfs*, sqlite3_int64*);
+extern void xDlClose(sqlite3_vfs*, void*);
+extern int xRandomness(sqlite3_vfs*, int nByte, char *zOut);
+extern int xSleep(sqlite3_vfs*, int microseconds);
+extern int xCurrentTime(sqlite3_vfs*, double*);
+extern int xGetLastError(sqlite3_vfs*, int, char *);
+extern int xCurrentTimeInt64(sqlite3_vfs*, sqlite3_int64*);
 
 static sqlite3_vfs bottomless_vfs;
 
