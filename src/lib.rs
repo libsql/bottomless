@@ -291,9 +291,6 @@ const BOTTOMLESS_METHODS: sqlite3_io_methods = sqlite3_io_methods {
 };
 
 fn get_base_vfs_ptr(vfs: *mut sqlite3_vfs) -> *mut sqlite3_vfs {
-    debug!("base vfs: {:?}", unsafe {
-        (*vfs).pData as *mut sqlite3_vfs
-    });
     unsafe { (*vfs).pData as *mut sqlite3_vfs }
 }
 
