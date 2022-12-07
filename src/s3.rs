@@ -124,7 +124,11 @@ impl Replicator {
                 let key = obj
                     .key()
                     .ok_or_else(|| anyhow::anyhow!("Failed to get key for an object"))?;
-                info!("Object {}", key);
+                if !key.starts_with(&self.db_name) {
+                    debug!("skipping object {}", key);
+                    continue;
+                }
+                debug!("Loading {}", key);
                 let page = self
                     .client
                     .get_object()

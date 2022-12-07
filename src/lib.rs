@@ -329,7 +329,7 @@ pub fn xOpen(
         }
     };
     file.name = match name_str.rfind('/') {
-        Some(index) => name_str[index..].to_string(),
+        Some(index) => name_str[index + 1..].to_string(),
         None => name_str.to_string(),
     };
 
