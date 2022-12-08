@@ -1,6 +1,10 @@
 #![allow(non_snake_case)]
 
+mod replicator;
+
 use std::ffi::c_void;
+
+const SQLITE_CANTOPEN: i32 = 14;
 
 #[repr(C)]
 pub struct Wal {
@@ -55,7 +59,7 @@ pub struct libsql_wal_methods {
     xOpen: extern "C" fn(
         vfs: *const c_void,
         file: *const c_void,
-        wal_name: *const u8,
+        wal_name: *const i8,
         no_shm_mode: i32,
         max_size: i64,
         methods: *mut libsql_wal_methods,
@@ -117,6 +121,7 @@ pub struct libsql_wal_methods {
 
     // User data
     underlying_methods: *const libsql_wal_methods,
+    replicator: replicator::Replicator,
 }
 
 #[repr(C)]
@@ -134,18 +139,30 @@ pub struct PgHdr {
 pub extern "C" fn xOpen(
     vfs: *const c_void,
     file: *const c_void,
-    wal_name: *const u8,
+    wal_name: *const i8,
     no_shm_mode: i32,
     max_size: i64,
     methods: *mut libsql_wal_methods,
     wal: *mut *const Wal,
 ) -> i32 {
     tracing::trace!("Opening {}", unsafe {
-        std::ffi::CStr::from_ptr(wal_name as *const i8)
-            .to_str()
-            .unwrap()
+        std::ffi::CStr::from_ptr(wal_name).to_str().unwrap()
     });
     let orig_methods = unsafe { &*(*methods).underlying_methods };
+    let new_methods = unsafe { &mut *methods };
+
+    let name_str = match unsafe { std::ffi::CStr::from_ptr(wal_name).to_str() } {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("Failed to parse file name: {}", e);
+            return SQLITE_CANTOPEN;
+        }
+    };
+    let name = match name_str.rfind('/') {
+        Some(index) => name_str[index + 1..].to_string(),
+        None => name_str.to_string(),
+    };
+    new_methods.replicator.register_name(name);
     (orig_methods.xOpen)(vfs, file, wal_name, no_shm_mode, max_size, methods, wal)
 }
 
@@ -160,6 +177,7 @@ pub extern "C" fn xClose(
     n_buf: i32,
     z_buf: *mut u8,
 ) -> i32 {
+    tracing::debug!("Closing wal");
     let orig_methods = get_orig_methods(wal);
     (orig_methods.xClose)(wal, db, sync_flags, n_buf, z_buf)
 }
@@ -236,6 +254,36 @@ fn print_frames(page_headers: *const PgHdr) {
     }
 }
 
+pub(crate) struct PageHdrIter {
+    current_ptr: *const PgHdr,
+    page_size: usize,
+}
+
+impl PageHdrIter {
+    fn new(current_ptr: *const PgHdr, page_size: usize) -> Self {
+        Self {
+            current_ptr,
+            page_size,
+        }
+    }
+}
+
+impl std::iter::Iterator for PageHdrIter {
+    type Item = (i32, Vec<u8>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_ptr.is_null() {
+            return None;
+        }
+        let current_hdr: &PgHdr = unsafe { &*self.current_ptr };
+        let raw_data =
+            unsafe { std::slice::from_raw_parts(current_hdr.data as *const u8, self.page_size) };
+        let item = Some((current_hdr.pgno, raw_data.to_vec()));
+        self.current_ptr = current_hdr.dirty;
+        item
+    }
+}
+
 pub extern "C" fn xFrames(
     wal: *mut Wal,
     page_size: u32,
@@ -307,11 +355,12 @@ pub extern "C" fn xDb(wal: *mut Wal, db: *const c_void) {
 }
 
 pub extern "C" fn xPathnameLen(orig_len: i32) -> i32 {
-    orig_len
+    orig_len + 4
 }
 
 pub extern "C" fn xGetPathname(buf: *mut u8, orig: *const u8, orig_len: i32) {
     unsafe { std::ptr::copy(orig, buf, orig_len as usize) }
+    unsafe { std::ptr::copy("-wal".as_ptr(), buf.offset(orig_len as isize), 4) }
 }
 
 #[no_mangle]
@@ -326,6 +375,13 @@ pub extern "C" fn bottomless_methods(
     underlying_methods: *const libsql_wal_methods,
 ) -> *const libsql_wal_methods {
     let vwal_name: *const u8 = "bottomless\0".as_ptr();
+    let replicator = match replicator::Replicator::new() {
+        Ok(repl) => repl,
+        Err(e) => {
+            tracing::error!("Failed to initialize replicator: {}", e);
+            return std::ptr::null();
+        }
+    };
 
     Box::into_raw(Box::new(libsql_wal_methods {
         xOpen,
@@ -354,5 +410,6 @@ pub extern "C" fn bottomless_methods(
         b_uses_shm: 0,
         p_next: std::ptr::null(),
         underlying_methods,
+        replicator,
     }))
 }

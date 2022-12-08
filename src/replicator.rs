@@ -25,7 +25,7 @@ pub struct FetchedResults {
 impl Replicator {
     pub const PAGE_SIZE: usize = 4096;
 
-    pub fn new(db_name: impl Into<String>) -> Result<Self> {
+    pub fn new() -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -47,8 +47,14 @@ impl Replicator {
             write_buffer,
             runtime,
             bucket,
-            db_name: db_name.into(),
+            db_name: String::new(),
         })
+    }
+
+    pub fn register_name(&mut self, db_name: impl Into<String>) {
+        assert!(self.db_name.is_empty());
+        self.db_name = db_name.into();
+        tracing::debug!("Registered name: {}", self.db_name);
     }
 
     pub fn write(&mut self, offset: i64, data: &[u8]) {
