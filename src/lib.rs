@@ -163,6 +163,20 @@ pub extern "C" fn xOpen(
         None => name_str.to_string(),
     };
     new_methods.replicator.register_name(name);
+
+    /* EXPERIMENTAL
+       TODO:
+         1. -wal file present -> refuse to start, checkpoint first
+         2a. Main database file not empty: 
+              a. Create a generation timeuuid
+              b. Upload the database file to timeuuid/file
+              c. Start a new backup session
+         2b. Main database file empty:
+              a. Get latest timeuuid
+              b. Restore the main file + WAL logs, up to the marker
+
+    END OF EXPERIMENTAL */
+
     (orig_methods.xOpen)(vfs, file, wal_name, no_shm_mode, max_size, methods, wal)
 }
 
