@@ -2,7 +2,6 @@ use aws_sdk_s3::types::ByteStream;
 use aws_sdk_s3::{Client, Endpoint};
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
-use tracing::{debug, error, info};
 
 pub type Result<T> = anyhow::Result<T>;
 
@@ -13,6 +12,7 @@ pub struct Replicator {
     runtime: tokio::runtime::Runtime,
 
     pub(crate) bucket: String,
+    pub(crate) db_path: String,
     pub(crate) db_name: String,
 }
 
@@ -47,18 +47,29 @@ impl Replicator {
             write_buffer,
             runtime,
             bucket,
+            db_path: String::new(),
             db_name: String::new(),
         })
     }
 
-    pub fn register_name(&mut self, db_name: impl Into<String>) {
+    pub fn register_db(&mut self, db_path: impl Into<String>) {
         assert!(self.db_name.is_empty());
-        self.db_name = db_name.into();
-        tracing::debug!("Registered name: {}", self.db_name);
+        let db_path = db_path.into();
+        let name = match db_path.rfind('/') {
+            Some(index) => db_path[index + 1..].to_string(),
+            None => db_path.to_string(),
+        };
+        self.db_path = db_path;
+        self.db_name = name;
+        tracing::debug!(
+            "Registered name: {} (full path: {})",
+            self.db_name,
+            self.db_path
+        );
     }
 
     pub fn write(&mut self, offset: i64, data: &[u8]) {
-        info!("Write operation: {}:{}", offset, data.len());
+        tracing::info!("Write operation: {}:{}", offset, data.len());
         let mut bytes = BytesMut::new();
         bytes.extend_from_slice(data);
         self.write_buffer.insert(offset, bytes);
@@ -66,7 +77,7 @@ impl Replicator {
 
     // Sends the pages participating in a commit to S3
     pub fn commit(&mut self) -> Result<()> {
-        info!("Write buffer size: {}", self.write_buffer.len());
+        tracing::info!("Write buffer size: {}", self.write_buffer.len());
         self.runtime.block_on(async {
             for (offset, bytes) in &self.write_buffer {
                 let data: &[u8] = bytes;
@@ -77,7 +88,35 @@ impl Replicator {
                     ));
                 }
                 let key = format!("{}-{:012}", self.db_name, offset / Self::PAGE_SIZE as i64);
-                info!("Committing {}", key);
+                tracing::info!("Committing {}", key);
+                self.client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .body(ByteStream::from(data.to_owned()))
+                    .send()
+                    .await?;
+            }
+            self.write_buffer.clear();
+            Ok::<(), anyhow::Error>(())
+        })?;
+        Ok(())
+    }
+
+    // Sends the main database file to S3
+    pub fn snapshot_db(&mut self) -> Result<()> {
+        tracing::info!("");
+        self.runtime.block_on(async {
+            for (offset, bytes) in &self.write_buffer {
+                let data: &[u8] = bytes;
+                if data.len() != Self::PAGE_SIZE {
+                    return Err(anyhow::anyhow!(
+                        "Unexpected write not equal to page size: {}",
+                        data.len()
+                    ));
+                }
+                let key = format!("{}-{:012}", self.db_name, offset / Self::PAGE_SIZE as i64);
+                tracing::info!("Committing {}", key);
                 self.client
                     .put_object()
                     .bucket(&self.bucket)
@@ -108,7 +147,7 @@ impl Replicator {
     }
 
     pub fn boot(&self, next_marker: Option<String>) -> Result<FetchedResults> {
-        debug!("Bootstrapping from offset {:?}", next_marker);
+        tracing::debug!("Bootstrapping from offset {:?}", next_marker);
         self.runtime.block_on(async {
             let mut pages = Vec::new();
 
@@ -131,10 +170,10 @@ impl Replicator {
                     .key()
                     .ok_or_else(|| anyhow::anyhow!("Failed to get key for an object"))?;
                 if !key.starts_with(&self.db_name) {
-                    debug!("skipping object {}", key);
+                    tracing::debug!("skipping object {}", key);
                     continue;
                 }
-                debug!("Loading {}", key);
+                tracing::debug!("Loading {}", key);
                 let page = self
                     .client
                     .get_object()
@@ -151,7 +190,7 @@ impl Replicator {
                         let data = page.body.collect().await.map(|data| data.into_bytes())?;
                         pages.push((pgno, data));
                     }
-                    _ => error!("Failed to parse page number from key {}", key),
+                    _ => tracing::error!("Failed to parse page number from key {}", key),
                 }
             }
             Ok(FetchedResults {
@@ -162,5 +201,13 @@ impl Replicator {
                     .flatten(),
             })
         })
+    }
+
+    pub fn new_generation() -> uuid::Uuid {
+        let node_id = mac_address::get_mac_address()
+            .map(|a| a.map(|a| a.bytes()))
+            .unwrap_or(Some([0u8; 6]))
+            .unwrap_or([0u8; 6]);
+        uuid::Uuid::now_v1(&node_id)
     }
 }

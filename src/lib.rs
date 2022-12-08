@@ -4,13 +4,102 @@ mod replicator;
 
 use std::ffi::c_void;
 
+const SQLITE_OK: i32 = 0;
 const SQLITE_CANTOPEN: i32 = 14;
 
 #[repr(C)]
+#[derive(Debug)]
+pub struct sqlite3_file {
+    methods: *const sqlite3_io_methods,
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct sqlite3_vfs {
+    iVersion: i32,
+    szOsFile: i32,
+    mxPathname: i32,
+    pNext: *mut sqlite3_vfs,
+    zname: *const i8,
+    pData: *const c_void,
+    xOpen: unsafe extern "C" fn(
+        vfs: *mut sqlite3_vfs,
+        name: *const i8,
+        file: *mut sqlite3_file,
+        flags: i32,
+        out_flags: *mut i32,
+    ) -> i32,
+    xDelete: unsafe extern "C" fn(vfs: *mut sqlite3_vfs, name: *const i8, sync_dir: i32) -> i32,
+    xAccess: unsafe extern "C" fn(
+        vfs: *mut sqlite3_vfs,
+        name: *const i8,
+        flags: i32,
+        res: *mut i32,
+    ) -> i32,
+    xFullPathname:
+        unsafe extern "C" fn(vfs: *mut sqlite3_vfs, name: *const i8, n: i32, out: *mut i8) -> i32,
+    xDlOpen: unsafe extern "C" fn(vfs: *mut sqlite3_vfs, name: *const i8) -> *const c_void,
+    xDlError: unsafe extern "C" fn(vfs: *mut sqlite3_vfs, n: i32, msg: *mut u8),
+    xDlSym: unsafe extern "C" fn(
+        vfs: *mut sqlite3_vfs,
+        arg: *mut c_void,
+        symbol: *const u8,
+    ) -> unsafe extern "C" fn(),
+    xDlClose: unsafe extern "C" fn(vfs: *mut sqlite3_vfs, arg: *mut c_void),
+    xRandomness: unsafe extern "C" fn(vfs: *mut sqlite3_vfs, n_bytes: i32, out: *mut u8) -> i32,
+    xSleep: unsafe extern "C" fn(vfs: *mut sqlite3_vfs, ms: i32) -> i32,
+    xCurrentTime: unsafe extern "C" fn(vfs: *mut sqlite3_vfs, time: *mut f64) -> i32,
+    xGetLastError: unsafe extern "C" fn(vfs: *mut sqlite3_vfs, n: i32, buf: *mut u8) -> i32,
+    xCurrentTimeInt64: unsafe extern "C" fn(vfs: *mut sqlite3_vfs, time: *mut i64) -> i32,
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct sqlite3_io_methods {
+    iVersion: i32,
+    xClose: unsafe extern "C" fn(file_ptr: *mut sqlite3_file) -> i32,
+    xRead: unsafe extern "C" fn(file_ptr: *mut sqlite3_file, buf: *mut u8, n: i32, off: i64) -> i32,
+    xWrite:
+        unsafe extern "C" fn(file_ptr: *mut sqlite3_file, buf: *const u8, n: i32, off: i64) -> i32,
+    xTruncate: unsafe extern "C" fn(file_ptr: *mut sqlite3_file, size: i64) -> i32,
+    xSync: unsafe extern "C" fn(file_ptr: *mut sqlite3_file, flags: i32) -> i32,
+    xFileSize: unsafe extern "C" fn(file_ptr: *mut sqlite3_file, size: *mut i64) -> i32,
+    xLock: unsafe extern "C" fn(file_ptr: *mut sqlite3_file, lock: i32) -> i32,
+    xUnlock: unsafe extern "C" fn(file_ptr: *mut sqlite3_file, lock: i32) -> i32,
+    xCheckReservedLock: unsafe extern "C" fn(file_ptr: *mut sqlite3_file, res: *mut i32) -> i32,
+    xFileControl:
+        unsafe extern "C" fn(file_ptr: *mut sqlite3_file, op: i32, arg: *mut c_void) -> i32,
+    xSectorSize: unsafe extern "C" fn(file_ptr: *mut sqlite3_file) -> i32,
+    xDeviceCharacteristics: unsafe extern "C" fn(file_ptr: *mut sqlite3_file) -> i32,
+    /* v2
+    xShmMap: unsafe extern "C" fn(
+        file_ptr: *mut sqlite3_file,
+        pgno: i32,
+        pgsize: i32,
+        arg: i32,
+        addr: *mut *mut c_void,
+    ) -> i32,
+    xShmLock:
+        unsafe extern "C" fn(file_ptr: *mut sqlite3_file, offset: i32, n: i32, flags: i32) -> i32,
+    xShmBarrier: unsafe extern "C" fn(file_ptr: *mut sqlite3_file),
+    xShmUnmap: unsafe extern "C" fn(file_ptr: *mut sqlite3_file, delete_flag: i32) -> i32,
+    // v3
+    xFetch: unsafe extern "C" fn(
+        file_ptr: *mut sqlite3_file,
+        off: i64,
+        n: i32,
+        addr: *mut *mut c_void,
+    ) -> i32,
+    xUnfetch:
+        unsafe extern "C" fn(file_ptr: *mut sqlite3_file, off: i64, addr: *mut c_void) -> i32,
+    */
+}
+
+#[repr(C)]
 pub struct Wal {
-    vfs: *const c_void,
-    db_fd: *const c_void,
-    wal_fd: *const c_void,
+    vfs: *const sqlite3_vfs,
+    db_fd: *mut sqlite3_file,
+    wal_fd: *mut sqlite3_file,
     callback_value: u32,
     max_wal_size: i64,
     wi_data: i32,
@@ -30,7 +119,7 @@ pub struct Wal {
     hdr: WalIndexHdr,
     min_frame: u32,
     recalculate_checksums: u32,
-    wal_name: *const u8,
+    wal_name: *const i8,
     n_checkpoints: u32,
     // if debug defined: log_error
     // if snapshot defined: p_snapshot
@@ -57,8 +146,8 @@ pub struct WalIndexHdr {
 #[repr(C)]
 pub struct libsql_wal_methods {
     xOpen: extern "C" fn(
-        vfs: *const c_void,
-        file: *const c_void,
+        vfs: *const sqlite3_vfs,
+        file: *mut sqlite3_file,
         wal_name: *const i8,
         no_shm_mode: i32,
         max_size: i64,
@@ -137,8 +226,8 @@ pub struct PgHdr {
 }
 
 pub extern "C" fn xOpen(
-    vfs: *const c_void,
-    file: *const c_void,
+    vfs: *const sqlite3_vfs,
+    db_file: *mut sqlite3_file,
     wal_name: *const i8,
     no_shm_mode: i32,
     max_size: i64,
@@ -151,33 +240,70 @@ pub extern "C" fn xOpen(
     let orig_methods = unsafe { &*(*methods).underlying_methods };
     let new_methods = unsafe { &mut *methods };
 
-    let name_str = match unsafe { std::ffi::CStr::from_ptr(wal_name).to_str() } {
-        Ok(s) => s,
+    let db_path = match unsafe { std::ffi::CStr::from_ptr(wal_name).to_str() } {
+        Ok(s) => {
+            if s.ends_with("-wal") {
+                &s[0..s.len() - 4]
+            } else {
+                s
+            }
+        }
         Err(e) => {
             tracing::error!("Failed to parse file name: {}", e);
             return SQLITE_CANTOPEN;
         }
     };
-    let name = match name_str.rfind('/') {
-        Some(index) => name_str[index + 1..].to_string(),
-        None => name_str.to_string(),
-    };
-    new_methods.replicator.register_name(name);
+    new_methods.replicator.register_db(db_path);
 
-    /* EXPERIMENTAL
-       TODO:
-         1. -wal file present -> refuse to start, checkpoint first
-         2a. Main database file not empty: 
-              a. Create a generation timeuuid
-              b. Upload the database file to timeuuid/file
-              c. Start a new backup session
-         2b. Main database file empty:
-              a. Get latest timeuuid
-              b. Restore the main file + WAL logs, up to the marker
+    let mut native_db_size: i64 = 0;
+    unsafe {
+        ((*(*db_file).methods).xFileSize)(db_file, &mut native_db_size as *mut i64);
+    }
+    tracing::warn!(
+        "Native file size: {} ({} pages)",
+        native_db_size,
+        native_db_size / replicator::Replicator::PAGE_SIZE as i64
+    );
 
-    END OF EXPERIMENTAL */
+    let rc = (orig_methods.xOpen)(vfs, db_file, wal_name, no_shm_mode, max_size, methods, wal);
+    if rc != SQLITE_OK {
+        return rc;
+    }
 
-    (orig_methods.xOpen)(vfs, file, wal_name, no_shm_mode, max_size, methods, wal)
+    let mut native_wal_size: i64 = 0;
+    unsafe {
+        let wal_file = (*(*wal)).wal_fd;
+        ((*(*wal_file).methods).xFileSize)(wal_file, &mut native_wal_size as *mut i64);
+    }
+    tracing::warn!(
+        "Native -wal file size: {} ({} pages)",
+        native_wal_size,
+        native_wal_size / replicator::Replicator::PAGE_SIZE as i64
+    );
+
+    if native_db_size == 0 && native_wal_size == 0 {
+        tracing::info!("Restoring data from bottomless storage");
+    }
+
+    let generation = replicator::Replicator::new_generation();
+    tracing::warn!(
+        "Generation {} ({:?})",
+        generation,
+        generation.get_timestamp()
+    );
+
+    /* TODO:
+        1. -wal file present -> refuse to start, checkpoint first
+        2a. Main database file not empty:
+            a. Create a generation timeuuid
+            b. Upload the database file to timeuuid/file
+            c. Start a new backup session
+        2b. Main database file empty:
+            a. Get latest timeuuid
+            b. Restore the main file + WAL logs, up to the marker
+    */
+
+    SQLITE_OK
 }
 
 fn get_orig_methods(wal: *mut Wal) -> &'static libsql_wal_methods {
