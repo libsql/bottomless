@@ -1,3 +1,8 @@
+# WARNING, pivot, it will be based on virtual WAL and libSQL only
+
+Historical content below:
+
+
 # Bottomless S3-compatible VFS for libSQL/SQLite
 Work in heavy progress!
 
