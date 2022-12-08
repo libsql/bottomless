@@ -8,9 +8,11 @@ pub type Result<T> = anyhow::Result<T>;
 #[derive(Debug)]
 pub struct Replicator {
     client: Client,
-    write_buffer: HashMap<i64, BytesMut>,
+    write_buffer: HashMap<u32, (i32, BytesMut)>,
     runtime: tokio::runtime::Runtime,
 
+    pub(crate) next_frame: u32,
+    pub(crate) generation: uuid::Uuid,
     pub(crate) bucket: String,
     pub(crate) db_path: String,
     pub(crate) db_name: String,
@@ -42,11 +44,18 @@ impl Replicator {
         })?;
         let bucket =
             std::env::var("LIBSQL_BOTTOMLESS_BUCKET").unwrap_or_else(|_| "bottomless".to_string());
+        let node_id = mac_address::get_mac_address()
+            .map(|a| a.map(|a| a.bytes()))
+            .unwrap_or(Some([0u8; 6]))
+            .unwrap_or([0u8; 6]);
+        let generation = uuid::Uuid::now_v1(&node_id);
         Ok(Self {
             client,
             write_buffer,
             runtime,
             bucket,
+            next_frame: 1, //FIXME: needs to be loaded from S3
+            generation,
             db_path: String::new(),
             db_name: String::new(),
         })
@@ -68,26 +77,32 @@ impl Replicator {
         );
     }
 
-    pub fn write(&mut self, offset: i64, data: &[u8]) {
-        tracing::info!("Write operation: {}:{}", offset, data.len());
+    pub fn next_frame(&mut self) -> u32 {
+        self.next_frame += 1;
+        self.next_frame - 1
+    }
+
+    pub fn write(&mut self, pgno: i32, data: &[u8]) {
+        let frame = self.next_frame();
+        tracing::info!("Writing page {}:{} at frame {}", pgno, data.len(), frame);
         let mut bytes = BytesMut::new();
         bytes.extend_from_slice(data);
-        self.write_buffer.insert(offset, bytes);
+        self.write_buffer.insert(frame, (pgno, bytes));
     }
 
     // Sends the pages participating in a commit to S3
     pub fn commit(&mut self) -> Result<()> {
         tracing::info!("Write buffer size: {}", self.write_buffer.len());
         self.runtime.block_on(async {
-            for (offset, bytes) in &self.write_buffer {
+            let tasks = self.write_buffer.iter().map(|(frame, (pgno, bytes))| {
                 let data: &[u8] = bytes;
                 if data.len() != Self::PAGE_SIZE {
-                    return Err(anyhow::anyhow!(
-                        "Unexpected write not equal to page size: {}",
-                        data.len()
-                    ));
+                    tracing::warn!("Unexpected truncated page of size {}", data.len())
                 }
-                let key = format!("{}-{:012}", self.db_name, offset / Self::PAGE_SIZE as i64);
+                let key = format!(
+                    "{}/{}-{:012}-{:012}",
+                    self.generation, self.db_name, frame, pgno
+                );
                 tracing::info!("Committing {}", key);
                 self.client
                     .put_object()
@@ -95,8 +110,8 @@ impl Replicator {
                     .key(key)
                     .body(ByteStream::from(data.to_owned()))
                     .send()
-                    .await?;
-            }
+            });
+            futures::future::try_join_all(tasks).await?;
             self.write_buffer.clear();
             Ok::<(), anyhow::Error>(())
         })?;
@@ -104,30 +119,10 @@ impl Replicator {
     }
 
     // Sends the main database file to S3
-    pub fn snapshot_db(&mut self) -> Result<()> {
-        tracing::info!("");
-        self.runtime.block_on(async {
-            for (offset, bytes) in &self.write_buffer {
-                let data: &[u8] = bytes;
-                if data.len() != Self::PAGE_SIZE {
-                    return Err(anyhow::anyhow!(
-                        "Unexpected write not equal to page size: {}",
-                        data.len()
-                    ));
-                }
-                let key = format!("{}-{:012}", self.db_name, offset / Self::PAGE_SIZE as i64);
-                tracing::info!("Committing {}", key);
-                self.client
-                    .put_object()
-                    .bucket(&self.bucket)
-                    .key(key)
-                    .body(ByteStream::from(data.to_owned()))
-                    .send()
-                    .await?;
-            }
-            self.write_buffer.clear();
-            Ok::<(), anyhow::Error>(())
-        })?;
+    pub fn snapshot_main_db_file(&mut self) -> Result<()> {
+        tracing::error!(
+            "TODO: implement this! By sending the whole db file, make ByteStream from a file path"
+        );
         Ok(())
     }
 
@@ -201,13 +196,5 @@ impl Replicator {
                     .flatten(),
             })
         })
-    }
-
-    pub fn new_generation() -> uuid::Uuid {
-        let node_id = mac_address::get_mac_address()
-            .map(|a| a.map(|a| a.bytes()))
-            .unwrap_or(Some([0u8; 6]))
-            .unwrap_or([0u8; 6]);
-        uuid::Uuid::now_v1(&node_id)
     }
 }
