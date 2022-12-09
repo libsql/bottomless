@@ -25,6 +25,9 @@ pub struct FetchedResults {
 }
 
 impl Replicator {
+    // FIXME: this should be derived from the database config
+    // and preserved somewhere in order to only restore from
+    // matching page size.
     pub const PAGE_SIZE: usize = 4096;
 
     pub fn new() -> Result<Self> {
