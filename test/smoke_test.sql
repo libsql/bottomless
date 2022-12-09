@@ -9,3 +9,4 @@ INSERT INTO test VALUES (zeroblob(8193));
 INSERT INTO test VALUES ('hey');
 .mode column
 SELECT v, length(v) FROM test;
+.exit

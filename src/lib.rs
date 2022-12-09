@@ -21,6 +21,7 @@ pub extern "C" fn xOpen(
     });
     let orig_methods = unsafe { &*(*methods).underlying_methods };
     let new_methods = unsafe { &mut *methods };
+    let ref mut replicator = new_methods.replicator;
 
     let db_path = match unsafe { std::ffi::CStr::from_ptr(wal_name).to_str() } {
         Ok(s) => {
@@ -35,7 +36,7 @@ pub extern "C" fn xOpen(
             return ffi::SQLITE_CANTOPEN;
         }
     };
-    new_methods.replicator.register_db(db_path);
+    replicator.register_db(db_path);
 
     let mut native_db_size: i64 = 0;
     unsafe {
@@ -47,45 +48,23 @@ pub extern "C" fn xOpen(
         native_db_size / replicator::Replicator::PAGE_SIZE as i64
     );
 
-    let rc = (orig_methods.xOpen)(vfs, db_file, wal_name, no_shm_mode, max_size, methods, wal);
-    if rc != ffi::SQLITE_OK {
-        return rc;
+    match replicator.restore() {
+        Ok(()) => (),
+        Err(e) => {
+            tracing::error!("Failed to restore the database: {}", e);
+            return ffi::SQLITE_CANTOPEN;
+        }
     }
 
-    let mut native_wal_size: i64 = 0;
-    unsafe {
-        let wal_file = (*(*wal)).wal_fd;
-        ((*(*wal_file).methods).xFileSize)(wal_file, &mut native_wal_size as *mut i64);
-    }
-    tracing::warn!(
-        "Native -wal file size: {} ({} pages)",
-        native_wal_size,
-        native_wal_size / replicator::Replicator::PAGE_SIZE as i64
-    );
-
-    if native_db_size == 0 && native_wal_size == 0 {
-        tracing::info!("Restoring data from bottomless storage");
-        tracing::error!("Not implemented yet");
+    match replicator.snapshot_main_db_file() {
+        Ok(()) => (),
+        Err(e) => {
+            tracing::error!("Failed to snapshot the main db file: {}", e);
+            return ffi::SQLITE_CANTOPEN;
+        }
     }
 
-    tracing::warn!(
-        "Generation {} ({:?})",
-        new_methods.replicator.generation,
-        new_methods.replicator.generation.get_timestamp()
-    );
-
-    /* TODO:
-        1. -wal file present -> refuse to start, checkpoint first
-        2a. Main database file not empty:
-            a. Create a generation timeuuid
-            b. Upload the database file to timeuuid/file
-            c. Start a new backup session
-        2b. Main database file empty:
-            a. Get latest timeuuid
-            b. Restore the main file + WAL logs, up to the marker
-    */
-
-    ffi::SQLITE_OK
+    (orig_methods.xOpen)(vfs, db_file, wal_name, no_shm_mode, max_size, methods, wal)
 }
 
 fn get_orig_methods(wal: *mut Wal) -> &'static libsql_wal_methods {
@@ -210,8 +189,11 @@ pub extern "C" fn xCheckpoint(
     frames_in_wal: *mut i32,
     backfilled_frames: *mut i32,
 ) -> i32 {
+    tracing::debug!("Checkpoint");
+    //FIXME: checkpointing occasionally segfaults :(
     let orig_methods = get_orig_methods(wal);
-    (orig_methods.xCheckpoint)(
+    let methods = get_methods(wal);
+    let rc = (orig_methods.xCheckpoint)(
         wal,
         db,
         emode,
@@ -221,7 +203,26 @@ pub extern "C" fn xCheckpoint(
         z_buf,
         frames_in_wal,
         backfilled_frames,
-    )
+    );
+    if rc != ffi::SQLITE_OK {
+        return rc;
+    }
+
+    tracing::debug!("Will create a new generation");
+    methods.replicator.new_generation();
+    tracing::debug!("Snapshotting after checkpoint");
+    match methods.replicator.snapshot_main_db_file() {
+        Ok(()) => (),
+        Err(e) => {
+            tracing::error!(
+                "Failed to snapshot the main db file during checkpoint: {}",
+                e
+            );
+            return ffi::SQLITE_IOERR_WRITE;
+        }
+    }
+
+    ffi::SQLITE_OK
 }
 
 pub extern "C" fn xCallback(wal: *mut Wal) -> i32 {
