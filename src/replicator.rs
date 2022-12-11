@@ -135,18 +135,44 @@ impl Replicator {
             });
             futures::future::try_join_all(tasks).await?;
             self.write_buffer.clear();
+            // Last consistent frame is persisted in S3 in order to be able to recover
+            // from failured that happen in the middle of a commit, when only some
+            // of the pages that belong to a transaction are replicated.
+            let last_consistent_frame_key =
+                format!("{}/{}-consistent", self.generation, self.db_name);
+            tracing::info!("Last consistent frame: {}", self.next_frame - 1);
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(last_consistent_frame_key)
+                .body(ByteStream::from(Bytes::copy_from_slice(
+                    &(self.next_frame - 1).to_be_bytes(),
+                )))
+                .send()
+                .await?;
             Ok::<(), anyhow::Error>(())
         })?;
         Ok(())
     }
 
-    pub fn compress_main_db_file(&self) -> Result<String> {
+    fn read_change_counter(reader: &mut std::fs::File) -> Result<[u8; 4]> {
+        use std::io::{Read, Seek};
+        let mut counter = [0u8; 4];
+        reader.seek(std::io::SeekFrom::Start(24))?;
+        reader.read_exact(&mut counter)?;
+        Ok(counter)
+    }
+
+    // Returns the compressed database file path and its change counter, extracted
+    // from the header of page1 at offset 24..27 (as per SQLite documentation).
+    pub fn compress_main_db_file(&self) -> Result<(String, [u8; 4])> {
         let compressed_db = format!("{}.lz4", &self.db_path);
         let mut reader = std::fs::File::open(&self.db_path)?;
         let mut writer = lz4_flex::frame::FrameEncoder::new(std::fs::File::create(&compressed_db)?);
         std::io::copy(&mut reader, &mut writer)?;
         writer.finish()?;
-        Ok(compressed_db)
+        let change_counter = Self::read_change_counter(&mut reader)?;
+        Ok((compressed_db, change_counter))
     }
 
     // Sends the main database file to S3
@@ -157,7 +183,7 @@ impl Replicator {
         // are often sparse, so they compress well.
         // TODO: find a way to compress ByteStream on the fly instead of creating
         // an intermediary file.
-        let compressed_db_path = self.compress_main_db_file()?;
+        let (compressed_db_path, change_counter) = self.compress_main_db_file()?;
 
         self.runtime.block_on(async {
             let key = format!("{}/{}.lz4", self.generation, self.db_name);
@@ -166,6 +192,14 @@ impl Replicator {
                 .bucket(&self.bucket)
                 .key(key)
                 .body(ByteStream::from_path(&compressed_db_path).await?)
+                .send()
+                .await?;
+            let change_counter_key = format!("{}/{}.changecounter", self.generation, self.db_name);
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(change_counter_key)
+                .body(ByteStream::from(Bytes::copy_from_slice(&change_counter)))
                 .send()
                 .await?;
             Ok::<(), anyhow::Error>(())
@@ -200,7 +234,7 @@ impl Replicator {
     // FIXME: commit() needs to save the last consistent frame number,
     // and it needs to be taken into account here as well - only whole
     // valid transactions should be restored to WAL
-    pub fn restore(&self) -> Result<()> {
+    pub fn restore(&mut self) -> Result<()> {
         let newest_generation = match self.find_newest_generation() {
             Some(gen) => gen,
             None => {
@@ -208,10 +242,81 @@ impl Replicator {
                 return Ok(());
             }
         };
+
+        // Check if the database needs to be restored by inspecting the database
+        // change counter and the WAL size.
+        let local_change_counter =
+            Self::read_change_counter(&mut std::fs::File::open(&self.db_path)?)?;
+
         tracing::info!("Restoring from generation {}", newest_generation);
         self.runtime.block_on(async {
+            use bytes::Buf;
             use std::io::Write;
             use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+
+            let mut remote_change_counter = [0u8; 4];
+            if let Some(response) = self
+                .client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(&format!(
+                    "{}/{}.changecounter",
+                    newest_generation, self.db_name
+                ))
+                .send()
+                .await
+                .ok()
+            {
+                response
+                    .body
+                    .collect()
+                    .await?
+                    .copy_to_slice(&mut remote_change_counter)
+            }
+
+            tracing::warn!(
+                "Change counters: local={:?}, remote={:?}",
+                local_change_counter,
+                remote_change_counter
+            );
+            if local_change_counter == remote_change_counter {
+                let last_consistent_frame = match self
+                    .client
+                    .get_object()
+                    .bucket(&self.bucket)
+                    .key(&format!(
+                        "{}/{}-consistent",
+                        newest_generation, self.db_name
+                    ))
+                    .send()
+                    .await
+                    .ok()
+                {
+                    Some(response) => response.body.collect().await?.get_u32(),
+                    None => 0,
+                };
+
+                let wal_pages = match tokio::fs::File::open(&format!("{}-wal", &self.db_path))
+                    .await
+                    .ok()
+                {
+                    Some(file) => file.metadata().await?.len() / Self::PAGE_SIZE as u64,
+                    None => 0,
+                };
+                tracing::warn!(
+                    "Last consistent frame: {}; wal pages: {}",
+                    last_consistent_frame,
+                    wal_pages
+                );
+                if wal_pages == last_consistent_frame as u64 {
+                    self.generation = newest_generation;
+                    tracing::warn!(
+                        "Newest remote generation is up-to-date, reusing it in this session"
+                    );
+                    return Ok(());
+                }
+            }
+
             let db_file = self
                 .client
                 .get_object()

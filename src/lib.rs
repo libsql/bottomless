@@ -56,6 +56,8 @@ pub extern "C" fn xOpen(
         }
     }
 
+    // FIXME: only make a snapshot if one was not detected in current generation.
+    // Information if that should be done should be returned from restore()
     match replicator.snapshot_main_db_file() {
         Ok(()) => (),
         Err(e) => {
