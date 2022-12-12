@@ -74,6 +74,14 @@ impl Replicator {
         })
     }
 
+    fn get_object(&self, key: String) -> aws_sdk_s3::client::fluent_builders::GetObject {
+        self.client.get_object().bucket(&self.bucket).key(key)
+    }
+
+    fn list_objects(&self) -> aws_sdk_s3::client::fluent_builders::ListObjects {
+        self.client.list_objects().bucket(&self.bucket)
+    }
+
     fn generate_generation() -> uuid::Uuid {
         // This timestamp goes back in time - that allows us to list newest generations
         // first in the S3 bucket.
@@ -229,14 +237,7 @@ impl Replicator {
     // it should be more robust
     fn find_newest_generation(&self) -> Option<uuid::Uuid> {
         self.runtime.block_on(async {
-            let response = self
-                .client
-                .list_objects()
-                .bucket(&self.bucket)
-                .max_keys(1)
-                .send()
-                .await
-                .ok()?;
+            let response = self.list_objects().max_keys(1).send().await.ok()?;
             let objs = response.contents()?;
             let key = objs.first()?.key()?;
             let key = match key.find('/') {
@@ -252,10 +253,7 @@ impl Replicator {
         use bytes::Buf;
         let mut remote_change_counter = [0u8; 4];
         if let Ok(response) = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(&format!("{}/{}.changecounter", generation, self.db_name))
+            .get_object(format!("{}/{}.changecounter", generation, self.db_name))
             .send()
             .await
         {
@@ -272,10 +270,7 @@ impl Replicator {
         use bytes::Buf;
         Ok(
             match self
-                .client
-                .get_object()
-                .bucket(&self.bucket)
-                .key(&format!("{}/{}-consistent", generation, self.db_name))
+                .get_object(format!("{}/{}-consistent", generation, self.db_name))
                 .send()
                 .await
                 .ok()
@@ -286,17 +281,18 @@ impl Replicator {
         )
     }
 
-    async fn get_wal_page_count(&self) -> Result<u32> {
-        Ok(
-            match tokio::fs::File::open(&format!("{}-wal", &self.db_path))
-                .await
-                .ok()
-            {
+    async fn get_wal_page_count(&self) -> u32 {
+        match tokio::fs::File::open(&format!("{}-wal", &self.db_path)).await {
+            Ok(file) => {
+                let metadata = match file.metadata().await {
+                    Ok(metadata) => metadata,
+                    Err(_) => return 0,
+                };
                 // Each WAL file consists of a 32-byte WAL header and N entries of size (page size + 24)
-                Some(file) => (file.metadata().await?.len() / (Self::PAGE_SIZE + 24) as u64) as u32,
-                None => 0,
-            },
-        )
+                (metadata.len() / (Self::PAGE_SIZE + 24) as u64) as u32
+            }
+            Err(_) => 0,
+        }
     }
 
     fn parse_frame_and_page_numbers(key: &str) -> Option<(u32, i32)> {
@@ -308,9 +304,6 @@ impl Replicator {
         Some((frameno, pgno))
     }
 
-    // FIXME: commit() needs to save the last consistent frame number,
-    // and it needs to be taken into account here as well - only whole
-    // valid transactions should be restored to WAL
     pub fn restore(&self) -> Result<RestoreAction> {
         let newest_generation = match self.find_newest_generation() {
             Some(gen) => gen,
@@ -331,18 +324,13 @@ impl Replicator {
             use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
             let remote_change_counter = self.get_remote_change_counter(&newest_generation).await?;
-
-            tracing::warn!(
-                "Change counters: local={:?}, remote={:?}",
-                local_change_counter,
-                remote_change_counter
-            );
+            tracing::debug!("Counters: local={:?}, remote={:?}", local_change_counter, remote_change_counter);
 
             let last_consistent_frame = self.get_last_consistent_frame(&newest_generation).await?;
             tracing::info!("Last consistent remote frame: {}", last_consistent_frame);
 
             if local_change_counter == remote_change_counter {
-                let wal_pages = self.get_wal_page_count().await?;
+                let wal_pages = self.get_wal_page_count().await;
                 tracing::warn!("Consistent: {}; wal pages: {}", last_consistent_frame, wal_pages);
                 if wal_pages == last_consistent_frame {
                     tracing::warn!(
@@ -353,10 +341,7 @@ impl Replicator {
             }
 
             let db_file = self
-                .client
-                .get_object()
-                .bucket(&self.bucket)
-                .key(&format!("{}/{}.lz4", newest_generation, self.db_name))
+                .get_object(format!("{}/{}.lz4", newest_generation, self.db_name))
                 .send()
                 .await?;
             // TODO: decompress on the fly, without a separate file
@@ -383,11 +368,7 @@ impl Replicator {
                 .await
                 .ok();
             loop {
-                let mut list_request = self
-                    .client
-                    .list_objects()
-                    .bucket(&self.bucket)
-                    .prefix(&prefix);
+                let mut list_request = self.list_objects().prefix(&prefix);
                 if let Some(marker) = next_marker {
                     list_request = list_request.marker(marker);
                 }
@@ -406,13 +387,7 @@ impl Replicator {
                         .key()
                         .ok_or_else(|| anyhow::anyhow!("Failed to get key for an object"))?;
                     tracing::debug!("Loading {}", key);
-                    let frame = self
-                        .client
-                        .get_object()
-                        .bucket(&self.bucket)
-                        .key(key)
-                        .send()
-                        .await?;
+                    let frame = self.get_object(key.into()).send().await?;
 
                     let (frameno, pgno) = match Self::parse_frame_and_page_numbers(key) {
                         Some(result) => result,
@@ -453,73 +428,11 @@ impl Replicator {
 
     pub fn is_bucket_empty(&self) -> Result<bool> {
         self.runtime.block_on(async {
-            let objs = self
-                .client
-                .list_objects()
-                .bucket(&self.bucket)
-                .send()
-                .await?;
+            let objs = self.list_objects().send().await?;
             match objs.contents() {
                 Some(objs) => Ok::<bool, anyhow::Error>(objs.is_empty()),
                 None => Ok::<bool, anyhow::Error>(true),
             }
-        })
-    }
-
-    pub fn boot(&self, next_marker: Option<String>) -> Result<FetchedResults> {
-        tracing::debug!("Bootstrapping from offset {:?}", next_marker);
-        self.runtime.block_on(async {
-            let mut pages = Vec::new();
-
-            let mut list_request = self.client.list_objects().bucket(&self.bucket).max_keys(2);
-            if let Some(marker) = next_marker {
-                list_request = list_request.marker(marker);
-            }
-            let response = list_request.send().await?;
-            let objs = match response.contents() {
-                Some(objs) => objs,
-                None => {
-                    return Ok(FetchedResults {
-                        pages,
-                        next_marker: None,
-                    })
-                }
-            };
-            for obj in objs {
-                let key = obj
-                    .key()
-                    .ok_or_else(|| anyhow::anyhow!("Failed to get key for an object"))?;
-                if !key.starts_with(&self.db_name) {
-                    tracing::debug!("skipping object {}", key);
-                    continue;
-                }
-                tracing::debug!("Loading {}", key);
-                let page = self
-                    .client
-                    .get_object()
-                    .bucket(&self.bucket)
-                    .key(key)
-                    .send()
-                    .await?;
-                // Format: <db-name>-<page-no>
-                match key
-                    .rfind('-')
-                    .map(|index| key[index + 1..].parse::<i32>().ok())
-                {
-                    Some(Some(pgno)) => {
-                        let data = page.body.collect().await.map(|data| data.into_bytes())?;
-                        pages.push((pgno, data));
-                    }
-                    _ => tracing::error!("Failed to parse page number from key {}", key),
-                }
-            }
-            Ok(FetchedResults {
-                pages,
-                next_marker: response
-                    .is_truncated()
-                    .then(|| objs.last().map(|elem| elem.key().unwrap().to_string()))
-                    .flatten(),
-            })
         })
     }
 }
