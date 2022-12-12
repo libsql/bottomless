@@ -299,6 +299,15 @@ impl Replicator {
         )
     }
 
+    fn parse_frame_and_page_numbers(key: &str) -> Option<(u32, i32)> {
+        // Format: <generation>/<db-name>-<frame-number>-<page-number>
+        let page_delim = key.rfind('-')?;
+        let frame_delim = key[0..page_delim].rfind('-')?;
+        let frameno = key[frame_delim + 1..page_delim].parse::<u32>().ok()?;
+        let pgno = key[page_delim + 1..].parse::<i32>().ok()?;
+        Some((frameno, pgno))
+    }
+
     // FIXME: commit() needs to save the last consistent frame number,
     // and it needs to be taken into account here as well - only whole
     // valid transactions should be restored to WAL
@@ -328,12 +337,14 @@ impl Replicator {
                 local_change_counter,
                 remote_change_counter
             );
-            if local_change_counter == remote_change_counter {
-                let last_consistent = self.get_last_consistent_frame(&newest_generation).await?;
 
+            let last_consistent_frame = self.get_last_consistent_frame(&newest_generation).await?;
+            tracing::info!("Last consistent remote frame: {}", last_consistent_frame);
+
+            if local_change_counter == remote_change_counter {
                 let wal_pages = self.get_wal_page_count().await?;
-                tracing::warn!("Consistent: {}; wal pages: {}", last_consistent, wal_pages);
-                if wal_pages == last_consistent {
+                tracing::warn!("Consistent: {}; wal pages: {}", last_consistent_frame, wal_pages);
+                if wal_pages == last_consistent_frame {
                     tracing::warn!(
                         "Newest remote generation is up-to-date, reusing it in this session"
                     );
@@ -357,9 +368,9 @@ impl Replicator {
             let mut decompressed_reader =
                 lz4_flex::frame::FrameDecoder::new(std::fs::File::open(&compressed_db_path)?);
             let mut main_db_writer = std::fs::File::create(&self.db_path)?;
+            // FIXME: verify if rewriting the database file is OK during WAL::xOpen
             std::io::copy(&mut decompressed_reader, &mut main_db_writer)?;
             main_db_writer.flush()?;
-            // FIXME: that needs to be done during VFS open, this is likely too late
             tracing::info!("Restored main db file");
 
             let mut next_marker = None;
@@ -389,7 +400,7 @@ impl Replicator {
                     .append(true)
                     .open(&self.db_path)
                     .await?;
-                //TODO: concurrency
+                //TODO: consider higher concurrency
                 for obj in objs {
                     let key = obj
                         .key()
@@ -402,35 +413,19 @@ impl Replicator {
                         .key(key)
                         .send()
                         .await?;
-                    // Format: <generation>/<db-name>-<frame-number>-<page-number>
-                    let page_delim = match key.rfind('-') {
-                        Some(delim) => delim,
+
+                    let (frameno, pgno) = match Self::parse_frame_and_page_numbers(key) {
+                        Some(result) => result,
                         None => {
-                            tracing::debug!("Failed to extract page number from {}", key);
+                            tracing::debug!("Failed to parse frame/page from key {}", key);
                             continue;
                         }
                     };
-                    let frame_delim = match key[0..page_delim].rfind('-') {
-                        Some(delim) => delim,
-                        None => {
-                            tracing::debug!("Failed to extract frame number from {}", key);
-                            continue;
-                        }
-                    };
-                    let frameno = match key[frame_delim + 1..page_delim].parse::<i32>().ok() {
-                        Some(frameno) => frameno,
-                        None => {
-                            tracing::debug!("Failed to parse frame number from {}", key);
-                            continue;
-                        }
-                    };
-                    let pgno = match key[page_delim + 1..].parse::<i32>().ok() {
-                        Some(pgno) => pgno,
-                        None => {
-                            tracing::debug!("Failed to parse page number from {}", key);
-                            continue;
-                        }
-                    };
+                    if frameno > last_consistent_frame {
+                        tracing::warn!("Remote log contains frame {} larger than last consistent frame ({}), stopping the restoration",
+                                frameno, last_consistent_frame);
+                        break
+                    }
                     let mut data = frame.body.into_async_read();
                     main_db_async_writer
                         .seek(tokio::io::SeekFrom::Start(
@@ -448,7 +443,7 @@ impl Replicator {
                     .then(|| objs.last().map(|elem| elem.key().unwrap().to_string()))
                     .flatten();
                 if next_marker.is_none() {
-                    break;
+                    break
                 }
             }
 
