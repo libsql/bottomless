@@ -116,15 +116,16 @@ impl Replicator {
     pub fn commit(&mut self) -> Result<()> {
         tracing::info!("Write buffer size: {}", self.write_buffer.len());
         self.runtime.block_on(async {
-            let tasks = self.write_buffer.iter().map(|(frame, (_pgno, bytes))| {
+            let tasks = self.write_buffer.iter().map(|(frame, (pgno, bytes))| {
                 let data: &[u8] = bytes;
                 if data.len() != Self::PAGE_SIZE {
                     tracing::warn!("Unexpected truncated page of size {}", data.len())
                 }
-                // NOTICE: Current format is <generation>/<db-name>-<frame-number>
-                // Currently page number isn't registered anywhere, but it should
-                // once we allow online read replicas.
-                let key = format!("{}/{}-{:012}", self.generation, self.db_name, frame);
+                // NOTICE: Current format is <generation>/<db-name>-<frame-number>-<page-number>
+                let key = format!(
+                    "{}/{}-{:012}-{:012}",
+                    self.generation, self.db_name, frame, pgno
+                );
                 tracing::info!("Committing {}", key);
                 self.client
                     .put_object()
@@ -177,6 +178,10 @@ impl Replicator {
 
     // Sends the main database file to S3
     pub fn snapshot_main_db_file(&mut self) -> Result<()> {
+        if !std::path::Path::new(&self.db_path).exists() {
+            tracing::info!("Not snapshotting, the main db file does not exist");
+            return Ok(());
+        }
         tracing::debug!("Snapshotting {}", self.db_path);
 
         // The main file is compressed, because snapshotting is rare, and libSQL pages
@@ -313,7 +318,7 @@ impl Replicator {
                     tracing::warn!(
                         "Newest remote generation is up-to-date, reusing it in this session"
                     );
-                    return Ok(());
+                    //FIXME: return Ok(());
                 }
             }
 
@@ -332,26 +337,21 @@ impl Replicator {
             compressed_writer.flush().await?;
             let mut decompressed_reader =
                 lz4_flex::frame::FrameDecoder::new(std::fs::File::open(&compressed_db_path)?);
-            let mut decompressed_writer = std::fs::File::create(&self.db_path)?;
-            std::io::copy(&mut decompressed_reader, &mut decompressed_writer)?;
-            decompressed_writer.flush()?;
+            let mut main_db_writer = std::fs::File::create(&self.db_path)?;
+            std::io::copy(&mut decompressed_reader, &mut main_db_writer)?;
+            main_db_writer.flush()?;
             // FIXME: that needs to be done during VFS open, this is likely too late
             tracing::info!("Restored main db file");
 
-            tracing::info!("Now WAL");
             let mut next_marker = None;
             let prefix = format!("{}/", newest_generation);
-            tracing::warn!(
-                "Potentially overwriting any existing WAL file: {}-wal",
-                &self.db_path
-            );
+            tracing::warn!("Overwriting any existing WAL file: {}-wal", &self.db_path);
             tokio::fs::remove_file(&format!("{}-wal", &self.db_path))
                 .await
                 .ok();
             tokio::fs::remove_file(&format!("{}-shm", &self.db_path))
                 .await
                 .ok();
-            let mut wal_file = tokio::fs::File::create(&format!("{}-wal", &self.db_path)).await?;
             loop {
                 let mut list_request = self
                     .client
@@ -367,6 +367,10 @@ impl Replicator {
                     Some(objs) => objs,
                     None => return Ok(()),
                 };
+                let mut main_db_async_writer = tokio::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&self.db_path)
+                    .await?;
                 //TODO: concurrency
                 for obj in objs {
                     let key = obj
@@ -380,23 +384,55 @@ impl Replicator {
                         .key(key)
                         .send()
                         .await?;
-                    // Format: <generation>/<db-name>-<frame-number>
-                    match key
-                        .rfind('-')
-                        .map(|index| key[index + 1..].parse::<i32>().ok())
-                    {
-                        Some(Some(frameno)) => {
-                            tracing::info!("Writing WAL frame {}", frameno);
-                            let mut data = frame.body.into_async_read();
-                            wal_file
-                                .seek(tokio::io::SeekFrom::Start(
-                                    frameno as u64 * Self::PAGE_SIZE as u64,
-                                ))
-                                .await?;
-                            tokio::io::copy(&mut data, &mut wal_file).await?;
-                            wal_file.flush().await?;
-                        }
-                        _ => tracing::debug!("Failed to parse frame number from key {}", key),
+                    // Format: <generation>/<db-name>-<frame-number>-<page-number>
+                    match key.rfind('-') {
+                        Some(page_delimiter) => match key[0..page_delimiter].rfind('-') {
+                            Some(frame_delimiter) => {
+                                let frameno = match key[frame_delimiter + 1..page_delimiter]
+                                    .parse::<i32>()
+                                    .ok()
+                                {
+                                    Some(frameno) => frameno,
+                                    None => {
+                                        tracing::debug!(
+                                            "Failed to parse frame number from key {}",
+                                            key
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let pgno = match key[page_delimiter + 1..].parse::<i32>().ok() {
+                                    Some(pgno) => pgno,
+                                    None => {
+                                        tracing::debug!(
+                                            "Failed to parse page number from key {}",
+                                            key
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let mut data = frame.body.into_async_read();
+                                main_db_async_writer
+                                    .seek(tokio::io::SeekFrom::Start(
+                                        pgno as u64 * Self::PAGE_SIZE as u64,
+                                    ))
+                                    .await?;
+                                // FIXME: we only need to overwrite with the newest page,
+                                // no need to replay the whole WAL
+                                tokio::io::copy(&mut data, &mut main_db_async_writer).await?;
+                                main_db_async_writer.flush().await?;
+                                tracing::info!(
+                                    "Written frame {} as main db page {}",
+                                    frameno,
+                                    pgno
+                                );
+                            }
+                            None => {
+                                tracing::debug!("Failed to extract frame number from key {}", key)
+                            }
+                        },
+
+                        None => tracing::debug!("Failed to extract page number from key {}", key),
                     }
                 }
                 next_marker = response

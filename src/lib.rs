@@ -210,7 +210,6 @@ pub extern "C" fn xCheckpoint(
         return rc;
     }
 
-    tracing::debug!("Will create a new generation");
     methods.replicator.new_generation();
     tracing::debug!("Snapshotting after checkpoint");
     match methods.replicator.snapshot_main_db_file() {
