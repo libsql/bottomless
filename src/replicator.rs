@@ -24,6 +24,13 @@ pub struct FetchedResults {
     pub next_marker: Option<String>,
 }
 
+#[derive(Debug)]
+pub enum RestoreAction {
+    None,
+    SnapshotMainDbFile,
+    ReuseGeneration(uuid::Uuid),
+}
+
 impl Replicator {
     // FIXME: this should be derived from the database config
     // and preserved somewhere in order to only restore from
@@ -78,7 +85,12 @@ impl Replicator {
 
     pub fn new_generation(&mut self) {
         self.generation = Self::generate_generation();
-        tracing::info!("New generation started: {}", self.generation);
+        tracing::debug!("New generation started: {}", self.generation);
+    }
+
+    pub fn set_generation(&mut self, generation: uuid::Uuid) {
+        self.generation = generation;
+        tracing::info!("Generation set to {}", self.generation);
     }
 
     pub fn register_db(&mut self, db_path: impl Into<String>) {
@@ -236,15 +248,66 @@ impl Replicator {
         })
     }
 
+    async fn get_remote_change_counter(&self, generation: &uuid::Uuid) -> Result<[u8; 4]> {
+        use bytes::Buf;
+        let mut remote_change_counter = [0u8; 4];
+        if let Ok(response) = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&format!("{}/{}.changecounter", generation, self.db_name))
+            .send()
+            .await
+        {
+            response
+                .body
+                .collect()
+                .await?
+                .copy_to_slice(&mut remote_change_counter)
+        }
+        Ok(remote_change_counter)
+    }
+
+    async fn get_last_consistent_frame(&self, generation: &uuid::Uuid) -> Result<u32> {
+        use bytes::Buf;
+        Ok(
+            match self
+                .client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(&format!("{}/{}-consistent", generation, self.db_name))
+                .send()
+                .await
+                .ok()
+            {
+                Some(response) => response.body.collect().await?.get_u32(),
+                None => 0,
+            },
+        )
+    }
+
+    async fn get_wal_page_count(&self) -> Result<u32> {
+        Ok(
+            match tokio::fs::File::open(&format!("{}-wal", &self.db_path))
+                .await
+                .ok()
+            {
+                // Each WAL file consists of a 32-byte WAL header and N entries of size (page size + 24)
+                Some(file) => (file.metadata().await?.len() / (Self::PAGE_SIZE + 24) as u64) as u32,
+                None => 0,
+            },
+        )
+    }
+
     // FIXME: commit() needs to save the last consistent frame number,
     // and it needs to be taken into account here as well - only whole
     // valid transactions should be restored to WAL
-    pub fn restore(&mut self) -> Result<()> {
+    pub fn restore(&self) -> Result<RestoreAction> {
         let newest_generation = match self.find_newest_generation() {
             Some(gen) => gen,
             None => {
                 tracing::info!("No generation found, nothing to restore");
-                return Ok(());
+                return Ok(RestoreAction::None);
             }
         };
 
@@ -255,29 +318,10 @@ impl Replicator {
 
         tracing::info!("Restoring from generation {}", newest_generation);
         self.runtime.block_on(async {
-            use bytes::Buf;
             use std::io::Write;
             use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
-            let mut remote_change_counter = [0u8; 4];
-            if let Some(response) = self
-                .client
-                .get_object()
-                .bucket(&self.bucket)
-                .key(&format!(
-                    "{}/{}.changecounter",
-                    newest_generation, self.db_name
-                ))
-                .send()
-                .await
-                .ok()
-            {
-                response
-                    .body
-                    .collect()
-                    .await?
-                    .copy_to_slice(&mut remote_change_counter)
-            }
+            let remote_change_counter = self.get_remote_change_counter(&newest_generation).await?;
 
             tracing::warn!(
                 "Change counters: local={:?}, remote={:?}",
@@ -285,40 +329,15 @@ impl Replicator {
                 remote_change_counter
             );
             if local_change_counter == remote_change_counter {
-                let last_consistent_frame = match self
-                    .client
-                    .get_object()
-                    .bucket(&self.bucket)
-                    .key(&format!(
-                        "{}/{}-consistent",
-                        newest_generation, self.db_name
-                    ))
-                    .send()
-                    .await
-                    .ok()
-                {
-                    Some(response) => response.body.collect().await?.get_u32(),
-                    None => 0,
-                };
+                let last_consistent = self.get_last_consistent_frame(&newest_generation).await?;
 
-                let wal_pages = match tokio::fs::File::open(&format!("{}-wal", &self.db_path))
-                    .await
-                    .ok()
-                {
-                    Some(file) => file.metadata().await?.len() / Self::PAGE_SIZE as u64,
-                    None => 0,
-                };
-                tracing::warn!(
-                    "Last consistent frame: {}; wal pages: {}",
-                    last_consistent_frame,
-                    wal_pages
-                );
-                if wal_pages == last_consistent_frame as u64 {
-                    self.generation = newest_generation;
+                let wal_pages = self.get_wal_page_count().await?;
+                tracing::warn!("Consistent: {}; wal pages: {}", last_consistent, wal_pages);
+                if wal_pages == last_consistent {
                     tracing::warn!(
                         "Newest remote generation is up-to-date, reusing it in this session"
                     );
-                    //FIXME: return Ok(());
+                    return Ok(RestoreAction::ReuseGeneration(newest_generation));
                 }
             }
 
@@ -357,15 +376,14 @@ impl Replicator {
                     .client
                     .list_objects()
                     .bucket(&self.bucket)
-                    .prefix(&prefix)
-                    .max_keys(2);
+                    .prefix(&prefix);
                 if let Some(marker) = next_marker {
                     list_request = list_request.marker(marker);
                 }
                 let response = list_request.send().await?;
                 let objs = match response.contents() {
                     Some(objs) => objs,
-                    None => return Ok(()),
+                    None => return Ok(RestoreAction::SnapshotMainDbFile),
                 };
                 let mut main_db_async_writer = tokio::fs::OpenOptions::new()
                     .append(true)
@@ -385,55 +403,45 @@ impl Replicator {
                         .send()
                         .await?;
                     // Format: <generation>/<db-name>-<frame-number>-<page-number>
-                    match key.rfind('-') {
-                        Some(page_delimiter) => match key[0..page_delimiter].rfind('-') {
-                            Some(frame_delimiter) => {
-                                let frameno = match key[frame_delimiter + 1..page_delimiter]
-                                    .parse::<i32>()
-                                    .ok()
-                                {
-                                    Some(frameno) => frameno,
-                                    None => {
-                                        tracing::debug!(
-                                            "Failed to parse frame number from key {}",
-                                            key
-                                        );
-                                        continue;
-                                    }
-                                };
-                                let pgno = match key[page_delimiter + 1..].parse::<i32>().ok() {
-                                    Some(pgno) => pgno,
-                                    None => {
-                                        tracing::debug!(
-                                            "Failed to parse page number from key {}",
-                                            key
-                                        );
-                                        continue;
-                                    }
-                                };
-                                let mut data = frame.body.into_async_read();
-                                main_db_async_writer
-                                    .seek(tokio::io::SeekFrom::Start(
-                                        pgno as u64 * Self::PAGE_SIZE as u64,
-                                    ))
-                                    .await?;
-                                // FIXME: we only need to overwrite with the newest page,
-                                // no need to replay the whole WAL
-                                tokio::io::copy(&mut data, &mut main_db_async_writer).await?;
-                                main_db_async_writer.flush().await?;
-                                tracing::info!(
-                                    "Written frame {} as main db page {}",
-                                    frameno,
-                                    pgno
-                                );
-                            }
-                            None => {
-                                tracing::debug!("Failed to extract frame number from key {}", key)
-                            }
-                        },
-
-                        None => tracing::debug!("Failed to extract page number from key {}", key),
-                    }
+                    let page_delim = match key.rfind('-') {
+                        Some(delim) => delim,
+                        None => {
+                            tracing::debug!("Failed to extract page number from {}", key);
+                            continue;
+                        }
+                    };
+                    let frame_delim = match key[0..page_delim].rfind('-') {
+                        Some(delim) => delim,
+                        None => {
+                            tracing::debug!("Failed to extract frame number from {}", key);
+                            continue;
+                        }
+                    };
+                    let frameno = match key[frame_delim + 1..page_delim].parse::<i32>().ok() {
+                        Some(frameno) => frameno,
+                        None => {
+                            tracing::debug!("Failed to parse frame number from {}", key);
+                            continue;
+                        }
+                    };
+                    let pgno = match key[page_delim + 1..].parse::<i32>().ok() {
+                        Some(pgno) => pgno,
+                        None => {
+                            tracing::debug!("Failed to parse page number from {}", key);
+                            continue;
+                        }
+                    };
+                    let mut data = frame.body.into_async_read();
+                    main_db_async_writer
+                        .seek(tokio::io::SeekFrom::Start(
+                            pgno as u64 * Self::PAGE_SIZE as u64,
+                        ))
+                        .await?;
+                    // FIXME: we only need to overwrite with the newest page,
+                    // no need to replay the whole WAL
+                    tokio::io::copy(&mut data, &mut main_db_async_writer).await?;
+                    main_db_async_writer.flush().await?;
+                    tracing::info!("Written frame {} as main db page {}", frameno, pgno);
                 }
                 next_marker = response
                     .is_truncated()
@@ -444,7 +452,7 @@ impl Replicator {
                 }
             }
 
-            Ok::<(), anyhow::Error>(())
+            Ok::<RestoreAction, anyhow::Error>(RestoreAction::SnapshotMainDbFile)
         })
     }
 

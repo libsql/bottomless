@@ -21,7 +21,7 @@ pub extern "C" fn xOpen(
     });
     let orig_methods = unsafe { &*(*methods).underlying_methods };
     let new_methods = unsafe { &mut *methods };
-    let ref mut replicator = new_methods.replicator;
+    let replicator = &mut new_methods.replicator;
 
     let db_path = match unsafe { std::ffi::CStr::from_ptr(wal_name).to_str() } {
         Ok(s) => {
@@ -49,19 +49,22 @@ pub extern "C" fn xOpen(
     );
 
     match replicator.restore() {
-        Ok(()) => (),
+        Ok(replicator::RestoreAction::None) => (),
+        Ok(replicator::RestoreAction::SnapshotMainDbFile) => {
+            //FIXME: decide whether it's a good place
+            match replicator.snapshot_main_db_file() {
+                Ok(()) => (),
+                Err(e) => {
+                    tracing::error!("Failed to snapshot the main db file: {}", e);
+                    return ffi::SQLITE_CANTOPEN;
+                }
+            }
+        }
+        Ok(replicator::RestoreAction::ReuseGeneration(gen)) => {
+            replicator.set_generation(gen);
+        }
         Err(e) => {
             tracing::error!("Failed to restore the database: {}", e);
-            return ffi::SQLITE_CANTOPEN;
-        }
-    }
-
-    // FIXME: only make a snapshot if one was not detected in current generation.
-    // Information if that should be done should be returned from restore()
-    match replicator.snapshot_main_db_file() {
-        Ok(()) => (),
-        Err(e) => {
-            tracing::error!("Failed to snapshot the main db file: {}", e);
             return ffi::SQLITE_CANTOPEN;
         }
     }
