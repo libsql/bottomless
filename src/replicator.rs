@@ -326,7 +326,7 @@ impl Replicator {
             use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
             let remote_change_counter = self.get_remote_change_counter(&newest_generation).await?;
-            tracing::debug!("Counters: local={:?}, remote={:?}", local_change_counter, remote_change_counter);
+            tracing::info!("Counters: local={:?}, remote={:?}", local_change_counter, remote_change_counter);
 
             let last_consistent_frame = self.get_last_consistent_frame(&newest_generation).await?;
             tracing::info!("Last consistent remote frame: {}", last_consistent_frame);
@@ -338,8 +338,14 @@ impl Replicator {
                     tracing::warn!(
                         "Newest remote generation is up-to-date, reusing it in this session"
                     );
-                    return Ok(RestoreAction::ReuseGeneration(newest_generation));
+                    return Ok(RestoreAction::ReuseGeneration(newest_generation))
                 }
+            } else if local_change_counter > remote_change_counter {
+                tracing::warn!("Local change counter is larger than its remote counterpart - a new snapshot needs to be replicated");
+                // FIXME: checkpoint needs to be performed here - apply all WAL pages
+                // to the main file before snapshotting.
+                // An alternative is to just replicate all WAL pages, but it sounds like a waste of throughput.
+                return Ok(RestoreAction::SnapshotMainDbFile)
             }
 
             let db_file = self
@@ -364,6 +370,8 @@ impl Replicator {
 
             let mut next_marker = None;
             let prefix = format!("{}/", newest_generation);
+            // FIXME: consider what to do with WAL present - if the change counters
+            // match and checksums do too, some of it could be applied locally first
             tracing::warn!("Overwriting any existing WAL file: {}-wal", &self.db_path);
             tokio::fs::remove_file(&format!("{}-wal", &self.db_path))
                 .await
