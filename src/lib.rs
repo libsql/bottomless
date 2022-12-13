@@ -135,7 +135,12 @@ pub extern "C" fn xFrames(
     )
 }
 
-#[tracing::instrument(skip(wal, db, busy_handler))]
+extern "C" fn always_wait(_busy_param: *mut c_void) -> i32 {
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    1
+}
+
+#[tracing::instrument(skip(wal, db))]
 pub extern "C" fn xCheckpoint(
     wal: *mut Wal,
     db: *mut c_void,
@@ -149,6 +154,32 @@ pub extern "C" fn xCheckpoint(
     backfilled_frames: *mut i32,
 ) -> i32 {
     tracing::debug!("Checkpoint");
+
+    /* In order to avoid partial checkpoints, passive checkpoint mode
+     ** is not allowed. Only FULL, RESTART and TRUNCATE checkpoints
+     ** are accepted, because these are guaranteed to block writes
+     ** and copy all WAL pages back into the main database file.
+     ** In order to make this mechanism work smoothly with the final
+     ** checkpoint on WAL close as well as default autocheckpoints,
+     ** mode is upgraded to SQLITE_CHECKPOINT_FULL if it's passive.
+     ** An alternative to consider is to just refuse passive checkpoints.
+     */
+    let emode = if emode < ffi::SQLITE_CHECKPOINT_FULL {
+        tracing::info!("Upgrading passive checkpoint to FULL mode");
+        ffi::SQLITE_CHECKPOINT_FULL
+    } else {
+        emode
+    };
+    /* If there's no busy handler, let's provide a default one,
+     ** since we auto-upgrade the passive checkpoint
+     */
+    let busy_handler = if (busy_handler as *const c_void).is_null() {
+        tracing::info!("Falling back to the default busy handler - always wait");
+        always_wait
+    } else {
+        busy_handler
+    };
+
     let orig_methods = get_orig_methods(wal);
     let methods = get_methods(wal);
     let rc = (orig_methods.xCheckpoint)(
@@ -167,13 +198,6 @@ pub extern "C" fn xCheckpoint(
         return rc;
     }
 
-    /*
-     ** Checkpointing can be partial - we need to create a new generation
-     ** only after a *full* checkpoint, which managed to backfill the whole
-     ** WAL file to the main database file.
-     ** Otherwise we'd have to move not-backfilled frames to the new generation.
-     ** Or perhaps we just need to ensure that a full checkpoint happened.
-     */
     methods.replicator.new_generation();
     tracing::debug!("Snapshotting after checkpoint");
     match methods.replicator.snapshot_main_db_file() {

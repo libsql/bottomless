@@ -4,6 +4,8 @@ pub const SQLITE_OK: i32 = 0;
 pub const SQLITE_CANTOPEN: i32 = 14;
 pub const SQLITE_IOERR_WRITE: i32 = 778;
 
+pub const SQLITE_CHECKPOINT_FULL: i32 = 1;
+
 #[repr(C)]
 #[derive(Debug)]
 pub struct sqlite3_file {
