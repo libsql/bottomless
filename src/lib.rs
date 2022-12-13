@@ -237,7 +237,7 @@ pub extern "C" fn xPreMainDbOpen(methods: *mut libsql_wal_methods, path: *const 
             }
         }
     };
-    tracing::warn!("Main database file {} will be open soon", path);
+    tracing::info!("Main database file {} will be open soon", path);
     let methods = unsafe { &mut *methods };
     let replicator = &mut methods.replicator;
 
