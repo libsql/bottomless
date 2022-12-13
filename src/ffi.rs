@@ -142,6 +142,7 @@ pub struct WalIndexHdr {
 
 #[repr(C)]
 pub struct libsql_wal_methods {
+    pub iVersion: i32,
     pub xOpen: extern "C" fn(
         vfs: *const sqlite3_vfs,
         file: *mut sqlite3_file,
@@ -186,6 +187,7 @@ pub struct libsql_wal_methods {
         db: *mut c_void,
         emode: i32,
         busy_handler: extern "C" fn(busy_param: *mut c_void) -> i32,
+        busy_arg: *const c_void,
         sync_flags: i32,
         n_buf: i32,
         z_buf: *mut u8,
@@ -201,6 +203,7 @@ pub struct libsql_wal_methods {
     pub xDb: extern "C" fn(wal: *mut Wal, db: *const c_void),
     pub xPathnameLen: extern "C" fn(orig_len: i32) -> i32,
     pub xGetPathname: extern "C" fn(buf: *mut u8, orig: *const u8, orig_len: i32),
+    pub xPreMainDbOpen: extern "C" fn(methods: *mut libsql_wal_methods, path: *const i8) -> i32,
     pub b_uses_shm: i32,
     pub name: *const u8,
     pub p_next: *const c_void,

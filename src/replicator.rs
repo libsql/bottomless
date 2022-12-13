@@ -309,14 +309,16 @@ impl Replicator {
             Some(gen) => gen,
             None => {
                 tracing::info!("No generation found, nothing to restore");
-                return Ok(RestoreAction::None);
+                return Ok(RestoreAction::SnapshotMainDbFile);
             }
         };
 
         // Check if the database needs to be restored by inspecting the database
         // change counter and the WAL size.
-        let local_change_counter =
-            Self::read_change_counter(&mut std::fs::File::open(&self.db_path)?)?;
+        let local_change_counter = match std::fs::File::open(&self.db_path) {
+            Ok(mut db) => Self::read_change_counter(&mut db)?,
+            Err(_) => [0u8; 4],
+        };
 
         tracing::info!("Restoring from generation {}", newest_generation);
         self.runtime.block_on(async {
@@ -353,7 +355,9 @@ impl Replicator {
             let mut decompressed_reader =
                 lz4_flex::frame::FrameDecoder::new(std::fs::File::open(&compressed_db_path)?);
             let mut main_db_writer = std::fs::File::create(&self.db_path)?;
-            // FIXME: verify if rewriting the database file is OK during WAL::xOpen
+            // FIXME: verify if rewriting the database file is OK during WAL::xOpen.
+            // It like isn't due to page cache. It more or less means that restoring
+            // needs to happen *before* the main database file is open in the first place.
             std::io::copy(&mut decompressed_reader, &mut main_db_writer)?;
             main_db_writer.flush()?;
             tracing::info!("Restored main db file");
@@ -367,6 +371,10 @@ impl Replicator {
             tokio::fs::remove_file(&format!("{}-shm", &self.db_path))
                 .await
                 .ok();
+            let mut main_db_async_writer = tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&self.db_path)
+                .await?;
             loop {
                 let mut list_request = self.list_objects().prefix(&prefix);
                 if let Some(marker) = next_marker {
@@ -377,10 +385,6 @@ impl Replicator {
                     Some(objs) => objs,
                     None => return Ok(RestoreAction::SnapshotMainDbFile),
                 };
-                let mut main_db_async_writer = tokio::fs::OpenOptions::new()
-                    .append(true)
-                    .open(&self.db_path)
-                    .await?;
                 //TODO: consider higher concurrency
                 for obj in objs {
                     let key = obj
@@ -402,11 +406,9 @@ impl Replicator {
                         break
                     }
                     let mut data = frame.body.into_async_read();
+                    let offset = pgno as u64 * Self::PAGE_SIZE as u64;
                     main_db_async_writer
-                        .seek(tokio::io::SeekFrom::Start(
-                            pgno as u64 * Self::PAGE_SIZE as u64,
-                        ))
-                        .await?;
+                        .seek(tokio::io::SeekFrom::Start(offset)).await?;
                     // FIXME: we only need to overwrite with the newest page,
                     // no need to replay the whole WAL
                     tokio::io::copy(&mut data, &mut main_db_async_writer).await?;
@@ -423,16 +425,6 @@ impl Replicator {
             }
 
             Ok::<RestoreAction, anyhow::Error>(RestoreAction::SnapshotMainDbFile)
-        })
-    }
-
-    pub fn is_bucket_empty(&self) -> Result<bool> {
-        self.runtime.block_on(async {
-            let objs = self.list_objects().send().await?;
-            match objs.contents() {
-                Some(objs) => Ok::<bool, anyhow::Error>(objs.is_empty()),
-                None => Ok::<bool, anyhow::Error>(true),
-            }
         })
     }
 }

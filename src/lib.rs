@@ -16,59 +16,10 @@ pub extern "C" fn xOpen(
     methods: *mut libsql_wal_methods,
     wal: *mut *const Wal,
 ) -> i32 {
-    tracing::trace!("Opening {}", unsafe {
+    tracing::warn!("Opening WAL {}", unsafe {
         std::ffi::CStr::from_ptr(wal_name).to_str().unwrap()
     });
     let orig_methods = unsafe { &*(*methods).underlying_methods };
-    let new_methods = unsafe { &mut *methods };
-    let replicator = &mut new_methods.replicator;
-
-    let db_path = match unsafe { std::ffi::CStr::from_ptr(wal_name).to_str() } {
-        Ok(s) => {
-            if s.ends_with("-wal") {
-                &s[0..s.len() - 4]
-            } else {
-                s
-            }
-        }
-        Err(e) => {
-            tracing::error!("Failed to parse file name: {}", e);
-            return ffi::SQLITE_CANTOPEN;
-        }
-    };
-    replicator.register_db(db_path);
-
-    let mut native_db_size: i64 = 0;
-    unsafe {
-        ((*(*db_file).methods).xFileSize)(db_file, &mut native_db_size as *mut i64);
-    }
-    tracing::warn!(
-        "Native file size: {} ({} pages)",
-        native_db_size,
-        native_db_size / replicator::Replicator::PAGE_SIZE as i64
-    );
-
-    match replicator.restore() {
-        Ok(replicator::RestoreAction::None) => (),
-        Ok(replicator::RestoreAction::SnapshotMainDbFile) => {
-            //FIXME: decide whether it's a good place
-            match replicator.snapshot_main_db_file() {
-                Ok(()) => (),
-                Err(e) => {
-                    tracing::error!("Failed to snapshot the main db file: {}", e);
-                    return ffi::SQLITE_CANTOPEN;
-                }
-            }
-        }
-        Ok(replicator::RestoreAction::ReuseGeneration(gen)) => {
-            replicator.set_generation(gen);
-        }
-        Err(e) => {
-            tracing::error!("Failed to restore the database: {}", e);
-            return ffi::SQLITE_CANTOPEN;
-        }
-    }
-
     (orig_methods.xOpen)(vfs, db_file, wal_name, no_shm_mode, max_size, methods, wal)
 }
 
@@ -173,6 +124,7 @@ pub extern "C" fn xFrames(
             }
         }
     }
+
     (orig_methods.xFrames)(
         wal,
         page_size,
@@ -183,11 +135,13 @@ pub extern "C" fn xFrames(
     )
 }
 
+#[tracing::instrument(skip(wal, db, busy_handler))]
 pub extern "C" fn xCheckpoint(
     wal: *mut Wal,
     db: *mut c_void,
     emode: i32,
     busy_handler: extern "C" fn(busy_param: *mut c_void) -> i32,
+    busy_arg: *const c_void,
     sync_flags: i32,
     n_buf: i32,
     z_buf: *mut u8,
@@ -195,7 +149,6 @@ pub extern "C" fn xCheckpoint(
     backfilled_frames: *mut i32,
 ) -> i32 {
     tracing::debug!("Checkpoint");
-    //FIXME: checkpointing occasionally segfaults :(
     let orig_methods = get_orig_methods(wal);
     let methods = get_methods(wal);
     let rc = (orig_methods.xCheckpoint)(
@@ -203,6 +156,7 @@ pub extern "C" fn xCheckpoint(
         db,
         emode,
         busy_handler,
+        busy_arg,
         sync_flags,
         n_buf,
         z_buf,
@@ -213,6 +167,13 @@ pub extern "C" fn xCheckpoint(
         return rc;
     }
 
+    /*
+     ** Checkpointing can be partial - we need to create a new generation
+     ** only after a *full* checkpoint, which managed to backfill the whole
+     ** WAL file to the main database file.
+     ** Otherwise we'd have to move not-backfilled frames to the new generation.
+     ** Or perhaps we just need to ensure that a full checkpoint happened.
+     */
     methods.replicator.new_generation();
     tracing::debug!("Snapshotting after checkpoint");
     match methods.replicator.snapshot_main_db_file() {
@@ -263,6 +224,49 @@ pub extern "C" fn xGetPathname(buf: *mut u8, orig: *const u8, orig_len: i32) {
     unsafe { std::ptr::copy("-wal".as_ptr(), buf.offset(orig_len as isize), 4) }
 }
 
+pub extern "C" fn xPreMainDbOpen(methods: *mut libsql_wal_methods, path: *const i8) -> i32 {
+    if path.is_null() {
+        return ffi::SQLITE_OK;
+    }
+    let path = unsafe {
+        match std::ffi::CStr::from_ptr(path).to_str() {
+            Ok(path) => path,
+            Err(e) => {
+                tracing::error!("Failed to parse the main database path: {}", e);
+                return ffi::SQLITE_CANTOPEN;
+            }
+        }
+    };
+    tracing::warn!("Main database file {} will be open soon", path);
+    let methods = unsafe { &mut *methods };
+    let replicator = &mut methods.replicator;
+
+    replicator.register_db(path);
+
+    match replicator.restore() {
+        Ok(replicator::RestoreAction::None) => (),
+        Ok(replicator::RestoreAction::SnapshotMainDbFile) => {
+            //FIXME: decide whether it's a good place
+            match replicator.snapshot_main_db_file() {
+                Ok(()) => (),
+                Err(e) => {
+                    tracing::error!("Failed to snapshot the main db file: {}", e);
+                    return ffi::SQLITE_CANTOPEN;
+                }
+            }
+        }
+        Ok(replicator::RestoreAction::ReuseGeneration(gen)) => {
+            replicator.set_generation(gen);
+        }
+        Err(e) => {
+            tracing::error!("Failed to restore the database: {}", e);
+            return ffi::SQLITE_CANTOPEN;
+        }
+    }
+
+    ffi::SQLITE_OK
+}
+
 #[no_mangle]
 pub extern "C" fn bottomless_init() {
     tracing_subscriber::fmt::init();
@@ -284,6 +288,7 @@ pub extern "C" fn bottomless_methods(
     };
 
     Box::into_raw(Box::new(libsql_wal_methods {
+        iVersion: 1,
         xOpen,
         xClose,
         xLimit,
@@ -306,6 +311,7 @@ pub extern "C" fn bottomless_methods(
         xDb,
         xPathnameLen,
         xGetPathname,
+        xPreMainDbOpen,
         name: vwal_name,
         b_uses_shm: 0,
         p_next: std::ptr::null(),

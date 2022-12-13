@@ -1,5 +1,7 @@
 /target
 /test/test.db
+/test/test.db.lz4
+/test/test.db.restored.lz4
 
 
 # Added by cargo
