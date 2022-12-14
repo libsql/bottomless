@@ -42,15 +42,12 @@ impl Replicator {
             .enable_all()
             .build()?;
         let write_buffer = HashMap::new();
-        let endpoint = std::env::var("LIBSQL_BOTTOMLESS_ENDPOINT")
-            .unwrap_or_else(|_| "http://localhost:9000".to_string());
         let client = runtime.block_on(async {
-            Ok::<Client, anyhow::Error>(Client::new(
-                &aws_config::from_env()
-                    .endpoint_resolver(Endpoint::immutable(endpoint.parse()?))
-                    .load()
-                    .await,
-            ))
+            let mut loader = aws_config::from_env();
+            if let Ok(endpoint) = std::env::var("LIBSQL_BOTTOMLESS_ENDPOINT") {
+                loader = loader.endpoint_resolver(Endpoint::immutable(endpoint.parse()?));
+            }
+            Ok::<Client, anyhow::Error>(Client::new(&loader.load().await))
         })?;
         let bucket =
             std::env::var("LIBSQL_BOTTOMLESS_BUCKET").unwrap_or_else(|_| "bottomless".to_string());

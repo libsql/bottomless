@@ -199,9 +199,15 @@ pub struct libsql_wal_methods {
     pub xCallback: extern "C" fn(wal: *mut Wal) -> i32,
     pub xExclusiveMode: extern "C" fn(wal: *mut Wal) -> i32,
     pub xHeapMemory: extern "C" fn(wal: *mut Wal) -> i32,
-    // snapshot: get, open, recover, check, unlock
-    // enable_zipvfs: framesize
+    // snapshot stubs
+    pub snapshot_get_stub: *const c_void,
+    pub snapshot_open_stub: *const c_void,
+    pub snapshot_recover_stub: *const c_void,
+    pub snapshot_check_stub: *const c_void,
+    pub snapshot_unlock_stub: *const c_void,
+    pub framesize_stub: *const c_void, // enable_zipvfs stub
     pub xFile: extern "C" fn(wal: *mut Wal) -> *const c_void,
+    pub write_lock_stub: *const c_void, // setlk stub
     pub xDb: extern "C" fn(wal: *mut Wal, db: *const c_void),
     pub xPathnameLen: extern "C" fn(orig_len: i32) -> i32,
     pub xGetPathname: extern "C" fn(buf: *mut u8, orig: *const u8, orig_len: i32),
