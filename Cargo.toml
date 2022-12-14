@@ -3,3 +3,9 @@ members = [
     "core",
     "cli",
 ]
+
+[profile.release]
+debug = false
+lto = true
+opt-level = "s"
+panic = "abort"
