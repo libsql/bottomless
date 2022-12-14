@@ -120,9 +120,9 @@ pub struct Wal {
     recalculate_checksums: u32,
     wal_name: *const i8,
     n_checkpoints: u32,
-    // if debug defined: log_error
-    // if snapshot defined: p_snapshot
-    // if setlk defined: *db
+    lock_error: u8,
+    p_snapshot: *const c_void,
+    p_db: *const c_void,
     pub wal_methods: *mut libsql_wal_methods,
 }
 

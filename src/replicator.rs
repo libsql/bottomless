@@ -140,8 +140,8 @@ impl Replicator {
                 }
                 // NOTICE: Current format is <generation>/<db-name>-<frame-number>-<page-number>
                 let key = format!(
-                    "{}/{}-{:012}-{:012}",
-                    self.generation, self.db_name, frame, pgno
+                    "{}-{}/{:012}-{:012}",
+                    self.db_name, self.generation, frame, pgno
                 );
                 tracing::info!("Committing {}", key);
                 self.client
@@ -157,7 +157,7 @@ impl Replicator {
             // from failured that happen in the middle of a commit, when only some
             // of the pages that belong to a transaction are replicated.
             let last_consistent_frame_key =
-                format!("{}/{}-consistent", self.generation, self.db_name);
+                format!("{}-{}/.consistent", self.db_name, self.generation);
             tracing::info!("Last consistent frame: {}", self.next_frame - 1);
             self.client
                 .put_object()
@@ -183,10 +183,10 @@ impl Replicator {
 
     // Returns the compressed database file path and its change counter, extracted
     // from the header of page1 at offset 24..27 (as per SQLite documentation).
-    pub fn compress_main_db_file(&self) -> Result<(String, [u8; 4])> {
-        let compressed_db = format!("{}.lz4", &self.db_path);
+    pub fn compress_main_db_file(&self) -> Result<(&'static str, [u8; 4])> {
+        let compressed_db = "db.lz4";
         let mut reader = std::fs::File::open(&self.db_path)?;
-        let mut writer = lz4_flex::frame::FrameEncoder::new(std::fs::File::create(&compressed_db)?);
+        let mut writer = lz4_flex::frame::FrameEncoder::new(std::fs::File::create(compressed_db)?);
         std::io::copy(&mut reader, &mut writer)?;
         writer.finish()?;
         let change_counter = Self::read_change_counter(&mut reader)?;
@@ -208,15 +208,15 @@ impl Replicator {
         let (compressed_db_path, change_counter) = self.compress_main_db_file()?;
 
         self.runtime.block_on(async {
-            let key = format!("{}/{}.lz4", self.generation, self.db_name);
+            let key = format!("{}-{}/db.lz4", self.db_name, self.generation);
             self.client
                 .put_object()
                 .bucket(&self.bucket)
                 .key(key)
-                .body(ByteStream::from_path(&compressed_db_path).await?)
+                .body(ByteStream::from_path(compressed_db_path).await?)
                 .send()
                 .await?;
-            let change_counter_key = format!("{}/{}.changecounter", self.generation, self.db_name);
+            let change_counter_key = format!("{}-{}/.changecounter", self.db_name, self.generation);
             self.client
                 .put_object()
                 .bucket(&self.bucket)
@@ -250,7 +250,7 @@ impl Replicator {
         use bytes::Buf;
         let mut remote_change_counter = [0u8; 4];
         if let Ok(response) = self
-            .get_object(format!("{}/{}.changecounter", generation, self.db_name))
+            .get_object(format!("{}-{}/.changecounter", self.db_name, generation))
             .send()
             .await
         {
@@ -267,7 +267,7 @@ impl Replicator {
         use bytes::Buf;
         Ok(
             match self
-                .get_object(format!("{}/{}-consistent", generation, self.db_name))
+                .get_object(format!("{}-{}/.consistent", self.db_name, generation))
                 .send()
                 .await
                 .ok()
@@ -346,17 +346,17 @@ impl Replicator {
             }
 
             let db_file = self
-                .get_object(format!("{}/{}.lz4", newest_generation, self.db_name))
+                .get_object(format!("{}-{}/db.lz4", self.db_name, newest_generation))
                 .send()
                 .await?;
             // TODO: decompress on the fly, without a separate file
-            let compressed_db_path = format!("{}.restored.lz4", self.db_path);
+            let compressed_db_path = "db.restored.lz4";
             let mut body_reader = db_file.body.into_async_read();
-            let mut compressed_writer = tokio::fs::File::create(&compressed_db_path).await?;
+            let mut compressed_writer = tokio::fs::File::create(compressed_db_path).await?;
             tokio::io::copy(&mut body_reader, &mut compressed_writer).await?;
             compressed_writer.flush().await?;
             let mut decompressed_reader =
-                lz4_flex::frame::FrameDecoder::new(std::fs::File::open(&compressed_db_path)?);
+                lz4_flex::frame::FrameDecoder::new(std::fs::File::open(compressed_db_path)?);
             let mut main_db_writer = std::fs::File::create(&self.db_path)?;
             // FIXME: verify if rewriting the database file is OK during WAL::xOpen.
             // It like isn't due to page cache. It more or less means that restoring
@@ -366,7 +366,7 @@ impl Replicator {
             tracing::info!("Restored main db file");
 
             let mut next_marker = None;
-            let prefix = format!("{}/", newest_generation);
+            let prefix = format!("{}-{}/", self.db_name, newest_generation);
             // FIXME: consider what to do with WAL present - if the change counters
             // match and checksums do too, some of it could be applied locally first
             tracing::warn!("Overwriting any existing WAL file: {}-wal", &self.db_path);
