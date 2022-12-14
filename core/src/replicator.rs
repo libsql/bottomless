@@ -181,12 +181,6 @@ impl Replicator {
         Ok(counter)
     }
 
-    async fn open_buffered(path: &str) -> Result<tokio::io::BufReader<tokio::fs::File>> {
-        Ok(tokio::io::BufReader::new(
-            tokio::fs::File::open(path).await?,
-        ))
-    }
-
     // Returns the compressed database file path and its change counter, extracted
     // from the header of page1 at offset 24..27 (as per SQLite documentation).
     pub async fn compress_main_db_file(&self) -> Result<(&'static str, [u8; 4])> {
@@ -214,7 +208,6 @@ impl Replicator {
         // are often sparse, so they compress well.
         // TODO: find a way to compress ByteStream on the fly instead of creating
         // an intermediary file.
-
         self.runtime.block_on(async {
             let (compressed_db_path, change_counter) = self.compress_main_db_file().await?;
             let key = format!("{}-{}/db.gz", self.db_name, self.generation);
@@ -244,7 +237,7 @@ impl Replicator {
         let objs = response.contents()?;
         let key = objs.first()?.key()?;
         let key = match key.find('/') {
-            Some(index) => &key[0..index],
+            Some(index) => &key[self.db_name.len() + 1..index],
             None => key,
         };
         tracing::info!("Generation candidate: {}", key);
@@ -357,20 +350,13 @@ impl Replicator {
             .get_object(format!("{}-{}/db.gz", self.db_name, generation))
             .send()
             .await?;
-        // TODO: decompress on the fly, without a separate file
-        let compressed_db_path = "db.restored.gz";
-        let mut body_reader = db_file.body.into_async_read();
-        let mut compressed_writer = tokio::fs::File::create(compressed_db_path).await?;
-        tokio::io::copy(&mut body_reader, &mut compressed_writer).await?;
-        compressed_writer.flush().await?;
-        let mut decompressed_reader = async_compression::tokio::bufread::GzipDecoder::new(
-            Self::open_buffered(compressed_db_path).await?,
+        let body_reader = db_file.body.into_async_read();
+        let mut decompress_reader = async_compression::tokio::bufread::GzipDecoder::new(
+            tokio::io::BufReader::new(body_reader),
         );
-        let mut main_db_writer = tokio::fs::OpenOptions::new()
-            .append(true)
-            .open(&self.db_path)
-            .await?;
-        tokio::io::copy(&mut decompressed_reader, &mut main_db_writer).await?;
+        tokio::fs::rename(&self.db_path, format!("{}.bottomless.backup", self.db_path)).await.ok(); // Best effort
+        let mut main_db_writer = tokio::fs::File::create(&self.db_path).await?;
+        tokio::io::copy(&mut decompress_reader, &mut main_db_writer).await?;
         main_db_writer.flush().await?;
         tracing::info!("Restored main db file");
 

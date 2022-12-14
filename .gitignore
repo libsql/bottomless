@@ -1,7 +1,7 @@
 /target
 /test/test.db
-/test/db.lz4
-/test/db.restored.lz4
+/test/*.bottomless.backup
+/test/db.gz
 
 
 # Added by cargo
