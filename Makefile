@@ -13,5 +13,5 @@ prep:
 	( cd libsql && ./configure && make )
 
 .PHONY: test
-test:	prep
+test:	debug prep
 	( cd test && ./smoke_test.sh )

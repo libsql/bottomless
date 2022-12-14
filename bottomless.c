@@ -1,4 +1,4 @@
-#include "/home/sarna/repo/libsql/sqlite3ext.h"
+#include "./libsql/sqlite3ext.h"
 SQLITE_EXTENSION_INIT1
 
 #include <stdio.h>
