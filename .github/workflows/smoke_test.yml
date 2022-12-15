@@ -1,0 +1,29 @@
+name: Check if it's possible to store and restore
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    services:
+      minio:
+        image: fclairamb/minio-github-actions
+        ports:
+          - 9000:9000
+    env:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      LIBSQL_BOTTOMLESS_BUCKET: bottomless
+      LIBSQL_BOTTOMLESS_ENDPOINT: http://localhost:9000
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: get submodules
+      run: git submodule update --init --recursive
+      
+    - name: Run tests
+      run: make test
