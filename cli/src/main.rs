@@ -1,18 +1,34 @@
-//use clap::{Parser, Subcommand};
 use anyhow::Result;
+use clap::{Parser, Subcommand};
 
-struct Client {
-    client: aws_sdk_s3::Client,
-    bucket: String,
+struct Replicator {
+    inner: bottomless::replicator::Replicator,
 }
 
-impl Client {
-    pub fn new(client: aws_sdk_s3::Client, bucket: String) -> Self {
-        Self { client, bucket }
+impl std::ops::Deref for Replicator {
+    type Target = bottomless::replicator::Replicator;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for Replicator {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl Replicator {
+    pub async fn new() -> Result<Self> {
+        Ok(Self {
+            inner: bottomless::replicator::Replicator::new().await?,
+        })
     }
 
-    pub async fn list_generations(&self, db: &str) -> Result<()> {
+    pub async fn list_generations(&self, db: &str, limit: Option<u64>) -> Result<()> {
         let mut next_marker = None;
+        let mut limit = limit.unwrap_or(u64::MAX);
         loop {
             let mut list_request = self
                 .client
@@ -52,6 +68,11 @@ impl Client {
                         .unwrap_or(chrono::NaiveDateTime::MIN);
                     println!("| {} | {:>24} UTC |", uuid, date);
                 }
+                limit -= 1;
+                if limit == 0 {
+                    println!("...");
+                    return Ok(());
+                }
             }
             println!("----------------------------------------------------------------------");
 
@@ -61,18 +82,59 @@ impl Client {
             }
         }
     }
+
+    //pub async fn list_generation(&self, db: &str, generation: &str) -> Result<()> {
+
+    //}
+}
+
+#[derive(Debug, Parser)]
+#[command(name = "bottomless-cli")]
+#[command(about = "Bottomless CLI", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+    #[clap(long, short)]
+    endpoint: Option<String>,
+    #[clap(long, short)]
+    database: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    #[clap(about="List available generations")]
+    Ls {
+        #[clap(long, short)]
+        limit: Option<u64>,
+    },
+    Restore {
+        #[clap(long, short)]
+        generation: Option<uuid::Uuid>,
+    }
 }
 
 #[tokio::main]
 async fn main() {
-    let mut loader = aws_config::from_env();
-    if let Ok(endpoint) = std::env::var("LIBSQL_BOTTOMLESS_ENDPOINT") {
-        loader =
-            loader.endpoint_resolver(aws_sdk_s3::Endpoint::immutable(endpoint.parse().unwrap()));
+    tracing_subscriber::fmt::init();
+    let options = Cli::parse();
+    
+    if let Some(ep) = options.endpoint {
+        std::env::set_var("LIBSQL_BOTTOMLESS_ENDPOINT", ep)
     }
-    let bucket =
-        std::env::var("LIBSQL_BOTTOMLESS_BUCKET").unwrap_or_else(|_| "bottomless".to_string());
-    let client = Client::new(aws_sdk_s3::Client::new(&loader.load().await), bucket);
+    let database = &options.database;
 
-    client.list_generations("test.db").await.unwrap();
+    let mut client = Replicator::new().await.unwrap();
+    client.register_db(database);
+
+    match options.command {
+        Commands::Ls { limit } => {
+            client.list_generations(database, limit).await.unwrap()
+        },
+        Commands::Restore { generation } => {
+            match generation {
+                Some(gen) => client.restore_from(gen).await.unwrap(),
+                None => client.restore().await.unwrap()
+            };
+        }
+    }
 }

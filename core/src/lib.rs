@@ -2,7 +2,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 mod ffi;
-mod replicator;
+pub mod replicator;
 
 use crate::ffi::{libsql_wal_methods, sqlite3_file, sqlite3_vfs, PgHdr, Wal};
 use std::ffi::c_void;

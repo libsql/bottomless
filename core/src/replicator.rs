@@ -7,14 +7,14 @@ pub type Result<T> = anyhow::Result<T>;
 
 #[derive(Debug)]
 pub struct Replicator {
-    client: Client,
+    pub client: Client,
     write_buffer: HashMap<u32, (i32, BytesMut)>,
 
     generation: uuid::Uuid,
     next_frame: u32,
-    pub(crate) bucket: String,
-    pub(crate) db_path: String,
-    pub(crate) db_name: String,
+    pub bucket: String,
+    pub db_path: String,
+    pub db_name: String,
 }
 
 #[derive(Debug)]

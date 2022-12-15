@@ -1,11 +1,11 @@
 [package]
 name = "bottomless"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 license = "MIT"
-keywords = ["libsql", "sqlite", "s3", "vfs", "replication"]
+keywords = ["libsql", "sqlite", "s3", "wal", "replication"]
 repository = "https://github.com/psarna/bottomless"
-description = "Bottomless VFS"
+description = "Bottomless replication for libSQL"
 
 [dependencies]
 anyhow = "1.0.66"
@@ -20,4 +20,4 @@ tracing-subscriber = "0.3.16"
 uuid = { version = "1.2.2", features = ["v7"] }
 
 [lib]
-crate-type = ["staticlib"]
+crate-type = ["rlib", "staticlib"]
