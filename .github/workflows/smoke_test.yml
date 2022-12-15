@@ -31,3 +31,6 @@ jobs:
       
     - name: Run tests
       run: make test
+
+    - name: Run restore test
+      run: ( cd test; ../libsql/libsql < restore_test.sql )
