@@ -23,9 +23,12 @@ jobs:
     steps:
     - uses: actions/checkout@v3
 
+    - name: set up mc
+      run: curl https://dl.min.io/client/mc/release/linux-amd64/mc -o mc && chmod +x mc
+
     - name: set up the bucket
-      run: curl https://dl.min.io/client/mc/release/linux-amd64/mc -o mc && chmod +x mc && ./mc mb bottomless
- 
+      run: ./mc alias set minio http://127.0.0.1:9000 $AWS_ACCESS_KEY_ID $AWS_SECRET_ACCESS_KEY && ./mc mb minio/bottomless
+
     - name: get submodules
       run: git submodule update --init --recursive
       
