@@ -14,4 +14,4 @@ prep:
 
 .PHONY: test
 test:	debug prep
-	( cd test && ./restore_test.sh )
+	( cd test && ./smoke_test.sh )
