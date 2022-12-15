@@ -24,7 +24,7 @@ jobs:
     - uses: actions/checkout@v3
 
     - name: set up the bucket
-      run: curl https://dl.min.io/client/mc/release/linux-amd64/mc -o mc && chmod +x mc && ./mc mb /data/bottomless/
+      run: curl https://dl.min.io/client/mc/release/linux-amd64/mc -o mc && chmod +x mc && ./mc mb bottomless
  
     - name: get submodules
       run: git submodule update --init --recursive
