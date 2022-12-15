@@ -277,10 +277,20 @@ pub extern "C" fn xPreMainDbOpen(methods: *mut libsql_wal_methods, path: *const 
         match replicator.restore().await {
             Ok(replicator::RestoreAction::None) => (),
             Ok(replicator::RestoreAction::SnapshotMainDbFile) => {
+                replicator.new_generation();
                 match replicator.snapshot_main_db_file().await {
                     Ok(()) => (),
                     Err(e) => {
                         tracing::error!("Failed to snapshot the main db file: {}", e);
+                        return ffi::SQLITE_CANTOPEN;
+                    }
+                }
+                // Restoration process only leaves the local WAL file if it was
+                // detected to be newer than its remote counterpart.
+                match replicator.maybe_replicate_wal().await {
+                    Ok(()) => (),
+                    Err(e) => {
+                        tracing::error!("Failed to replicate local WAL: {}", e);
                         return ffi::SQLITE_CANTOPEN;
                     }
                 }

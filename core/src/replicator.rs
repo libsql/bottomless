@@ -185,7 +185,61 @@ impl Replicator {
         Ok((compressed_db, change_counter))
     }
 
-    // Sends the main database file to S3
+    // Replicates local WAL pages to S3, if local WAL is present.
+    // This function is called under the assumption that if local WAL
+    // file is present, it was already detected to be newer than its
+    // remote counterpart.
+    pub async fn maybe_replicate_wal(&mut self) -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let mut wal_file = match tokio::fs::File::open(&format!("{}-wal", &self.db_path)).await {
+            Ok(file) => file,
+            Err(_) => {
+                tracing::info!("Local WAL not present - not replicating");
+                return Ok(());
+            }
+        };
+        let len = match wal_file.metadata().await {
+            Ok(metadata) => metadata.len(),
+            Err(_) => 0,
+        };
+        if len < 32 {
+            tracing::info!("Local WAL is empty, not replicating");
+            return Ok(());
+        }
+        tracing::info!("Local WAL pages: {}", (len - 32) / Self::PAGE_SIZE as u64);
+        for offset in (32..len).step_by(Self::PAGE_SIZE + 24) {
+            wal_file.seek(tokio::io::SeekFrom::Start(offset)).await?;
+            let pgno = wal_file.read_i32().await?;
+            let size_after_transaction = wal_file.read_i32().await?;
+            tracing::warn!(
+                "Size after transaction for {} is {}",
+                pgno,
+                size_after_transaction
+            );
+            wal_file
+                .seek(tokio::io::SeekFrom::Start(offset + 24))
+                .await?;
+            let mut data = [0u8; Self::PAGE_SIZE];
+            wal_file.read_exact(&mut data).await?;
+            self.write(pgno, &data);
+            // In multi-page transactions, only the last page in the transaction contains
+            // the size_after_transaction field. If it's zero, it means it's an uncommited
+            // page.
+            if size_after_transaction != 0 {
+                self.commit().await?;
+            }
+        }
+        if !self.write_buffer.is_empty() {
+            tracing::warn!("Uncommited WAL entries: {}", self.write_buffer.len());
+        }
+        self.write_buffer.clear();
+        tracing::info!("Local WAL replicated");
+        Ok(())
+    }
+
+    // Sends the main database file to S3 - if -wal file is present, it's replicated
+    // too - it means that the local file was detected to be newer than its remote
+    // counterpart.
     pub async fn snapshot_main_db_file(&mut self) -> Result<()> {
         if !std::path::Path::new(&self.db_path).exists() {
             tracing::info!("Not snapshotting, the main db file does not exist");
@@ -193,8 +247,6 @@ impl Replicator {
         }
         tracing::debug!("Snapshotting {}", self.db_path);
 
-        // The main file is compressed, because snapshotting is rare, and libSQL pages
-        // are often sparse, so they compress well.
         // TODO: find a way to compress ByteStream on the fly instead of creating
         // an intermediary file.
         let (compressed_db_path, change_counter) = self.compress_main_db_file().await?;
@@ -206,6 +258,12 @@ impl Replicator {
             .body(ByteStream::from_path(compressed_db_path).await?)
             .send()
             .await?;
+        /* FIXME: we can't rely on the change counter in WAL mode:
+         ** "In WAL mode, changes to the database are detected using the wal-index and
+         ** so the change counter is not needed. Hence, the change counter might not be
+         ** incremented on each transaction in WAL mode."
+         ** Instead, we need to consult WAL checksums.
+         */
         let change_counter_key = format!("{}-{}/.changecounter", self.db_name, self.generation);
         self.client
             .put_object()
@@ -288,13 +346,14 @@ impl Replicator {
     }
 
     pub async fn restore_from(&self, generation: uuid::Uuid) -> Result<RestoreAction> {
+        use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+
         // Check if the database needs to be restored by inspecting the database
         // change counter and the WAL size.
         let local_change_counter = match tokio::fs::File::open(&self.db_path).await {
             Ok(mut db) => Self::read_change_counter(&mut db).await?,
             Err(_) => [0u8; 4],
         };
-        use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
         let remote_change_counter = self.get_remote_change_counter(&generation).await?;
         tracing::info!(
@@ -314,16 +373,14 @@ impl Replicator {
                 wal_pages
             );
             if wal_pages == last_consistent_frame {
-                tracing::warn!(
-                    "Newest remote generation is up-to-date, reusing it in this session"
-                );
+                tracing::warn!("Remote generation is up-to-date, reusing it in this session");
                 return Ok(RestoreAction::ReuseGeneration(generation));
+            } else if wal_pages > last_consistent_frame {
+                tracing::warn!("Local change counter matches the remote one, but local WAL contains newer data, which needs to be replicated");
+                return Ok(RestoreAction::SnapshotMainDbFile);
             }
         } else if local_change_counter > remote_change_counter {
             tracing::warn!("Local change counter is larger than its remote counterpart - a new snapshot needs to be replicated");
-            // FIXME: checkpoint needs to be performed here - apply all WAL pages
-            // to the main file before snapshotting.
-            // An alternative is to just replicate all WAL pages, but it sounds like a waste of throughput.
             return Ok(RestoreAction::SnapshotMainDbFile);
         }
 
@@ -362,7 +419,7 @@ impl Replicator {
             let response = list_request.send().await?;
             let objs = match response.contents() {
                 Some(objs) => objs,
-                None => return Ok(RestoreAction::SnapshotMainDbFile),
+                None => break,
             };
             //TODO: consider higher concurrency
             for obj in objs {
