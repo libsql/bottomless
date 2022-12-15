@@ -49,3 +49,12 @@ jobs:
 
     - name: Run restore test yet again
       run: ( cd test; ../libsql/libsql < restore_test.sql )
+
+    - name: List generations with CLI
+      run: cargo run -- -e http://localhost:9000 -d test.db ls -v
+
+    - name: Restore the database with CLI
+      run: cargo run -- -e http://localhost:9000 -d test.db restore
+
+    - name: Verify the restored database
+      run: ./libsql/libsql test.db <<< "SELECT * FROM test;"
