@@ -9,7 +9,6 @@ pub type Result<T> = anyhow::Result<T>;
 pub struct Replicator {
     client: Client,
     write_buffer: HashMap<u32, (i32, BytesMut)>,
-    runtime: tokio::runtime::Runtime,
 
     generation: uuid::Uuid,
     next_frame: u32,
@@ -37,32 +36,26 @@ impl Replicator {
     // matching page size.
     pub const PAGE_SIZE: usize = 4096;
 
-    pub fn new() -> Result<Self> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
+    pub async fn new() -> Result<Self> {
         let write_buffer = HashMap::new();
-        let client = runtime.block_on(async {
-            let mut loader = aws_config::from_env();
-            if let Ok(endpoint) = std::env::var("LIBSQL_BOTTOMLESS_ENDPOINT") {
-                loader = loader.endpoint_resolver(Endpoint::immutable(endpoint.parse()?));
-            }
-            Ok::<Client, anyhow::Error>(Client::new(&loader.load().await))
-        })?;
+        let mut loader = aws_config::from_env();
+        if let Ok(endpoint) = std::env::var("LIBSQL_BOTTOMLESS_ENDPOINT") {
+            loader = loader.endpoint_resolver(Endpoint::immutable(endpoint.parse()?));
+        }
         let bucket =
             std::env::var("LIBSQL_BOTTOMLESS_BUCKET").unwrap_or_else(|_| "bottomless".to_string());
+        let client = Client::new(&loader.load().await);
         let generation = Self::generate_generation();
         tracing::debug!("Generation {}", generation);
         Ok(Self {
             client,
             write_buffer,
-            runtime,
             bucket,
             generation,
-            /* NOTICE: Next frame is 1 only if we always checkpoint on boot,
-             ** and start from a fresh snapshot of a database file
-             ** with an empty WAL. If this is not enforced, next frame
-             ** should be deduced from the replicated contents - it's the first
+            /* NOTICE: Next frame is 1 only if we always start from
+             ** a fresh snapshot of a database file with an empty WAL.
+             ** If this is not enforced, next frame should be deduced
+             ** from the replicated contents - it's the first
              ** unused frame number from the latest generation.
              */
             next_frame: 1,
@@ -130,46 +123,42 @@ impl Replicator {
     // Sends the pages participating in a commit to S3
     // FIXME: Newest consistent frame number needs to be stored right after committing
     // in order to be able to recover from a partial commit later
-    pub fn commit(&mut self) -> Result<()> {
+    pub async fn commit(&mut self) -> Result<()> {
         tracing::info!("Write buffer size: {}", self.write_buffer.len());
-        self.runtime.block_on(async {
-            let tasks = self.write_buffer.iter().map(|(frame, (pgno, bytes))| {
-                let data: &[u8] = bytes;
-                if data.len() != Self::PAGE_SIZE {
-                    tracing::warn!("Unexpected truncated page of size {}", data.len())
-                }
-                // NOTICE: Current format is <generation>/<db-name>-<frame-number>-<page-number>
-                let key = format!(
-                    "{}-{}/{:012}-{:012}",
-                    self.db_name, self.generation, frame, pgno
-                );
-                tracing::info!("Committing {}", key);
-                self.client
-                    .put_object()
-                    .bucket(&self.bucket)
-                    .key(key)
-                    .body(ByteStream::from(data.to_owned()))
-                    .send()
-            });
-            futures::future::try_join_all(tasks).await?;
-            self.write_buffer.clear();
-            // Last consistent frame is persisted in S3 in order to be able to recover
-            // from failured that happen in the middle of a commit, when only some
-            // of the pages that belong to a transaction are replicated.
-            let last_consistent_frame_key =
-                format!("{}-{}/.consistent", self.db_name, self.generation);
-            tracing::info!("Last consistent frame: {}", self.next_frame - 1);
+        let tasks = self.write_buffer.iter().map(|(frame, (pgno, bytes))| {
+            let data: &[u8] = bytes;
+            if data.len() != Self::PAGE_SIZE {
+                tracing::warn!("Unexpected truncated page of size {}", data.len())
+            }
+            // NOTICE: Current format is <generation>/<db-name>-<frame-number>-<page-number>
+            let key = format!(
+                "{}-{}/{:012}-{:012}",
+                self.db_name, self.generation, frame, pgno
+            );
+            tracing::info!("Committing {}", key);
             self.client
                 .put_object()
                 .bucket(&self.bucket)
-                .key(last_consistent_frame_key)
-                .body(ByteStream::from(Bytes::copy_from_slice(
-                    &(self.next_frame - 1).to_be_bytes(),
-                )))
+                .key(key)
+                .body(ByteStream::from(data.to_owned()))
                 .send()
-                .await?;
-            Ok::<(), anyhow::Error>(())
-        })?;
+        });
+        futures::future::try_join_all(tasks).await?;
+        self.write_buffer.clear();
+        // Last consistent frame is persisted in S3 in order to be able to recover
+        // from failured that happen in the middle of a commit, when only some
+        // of the pages that belong to a transaction are replicated.
+        let last_consistent_frame_key = format!("{}-{}/.consistent", self.db_name, self.generation);
+        tracing::info!("Last consistent frame: {}", self.next_frame - 1);
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(last_consistent_frame_key)
+            .body(ByteStream::from(Bytes::copy_from_slice(
+                &(self.next_frame - 1).to_be_bytes(),
+            )))
+            .send()
+            .await?;
         Ok(())
     }
 
@@ -197,7 +186,7 @@ impl Replicator {
     }
 
     // Sends the main database file to S3
-    pub fn snapshot_main_db_file(&mut self) -> Result<()> {
+    pub async fn snapshot_main_db_file(&mut self) -> Result<()> {
         if !std::path::Path::new(&self.db_path).exists() {
             tracing::info!("Not snapshotting, the main db file does not exist");
             return Ok(());
@@ -208,31 +197,30 @@ impl Replicator {
         // are often sparse, so they compress well.
         // TODO: find a way to compress ByteStream on the fly instead of creating
         // an intermediary file.
-        self.runtime.block_on(async {
-            let (compressed_db_path, change_counter) = self.compress_main_db_file().await?;
-            let key = format!("{}-{}/db.gz", self.db_name, self.generation);
-            self.client
-                .put_object()
-                .bucket(&self.bucket)
-                .key(key)
-                .body(ByteStream::from_path(compressed_db_path).await?)
-                .send()
-                .await?;
-            let change_counter_key = format!("{}-{}/.changecounter", self.db_name, self.generation);
-            self.client
-                .put_object()
-                .bucket(&self.bucket)
-                .key(change_counter_key)
-                .body(ByteStream::from(Bytes::copy_from_slice(&change_counter)))
-                .send()
-                .await?;
-            Ok::<(), anyhow::Error>(())
-        })?;
+        let (compressed_db_path, change_counter) = self.compress_main_db_file().await?;
+        let key = format!("{}-{}/db.gz", self.db_name, self.generation);
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(ByteStream::from_path(compressed_db_path).await?)
+            .send()
+            .await?;
+        let change_counter_key = format!("{}-{}/.changecounter", self.db_name, self.generation);
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(change_counter_key)
+            .body(ByteStream::from(Bytes::copy_from_slice(&change_counter)))
+            .send()
+            .await?;
         tracing::debug!("Main db snapshot complete");
         Ok(())
     }
 
-    async fn find_newest_generation_async(&self) -> Option<uuid::Uuid> {
+    //FIXME: assumes that this bucket stores *only* generations,
+    // it should be more robust
+    async fn find_newest_generation(&self) -> Option<uuid::Uuid> {
         let response = self.list_objects().max_keys(1).send().await.ok()?;
         let objs = response.contents()?;
         let key = objs.first()?.key()?;
@@ -242,13 +230,6 @@ impl Replicator {
         };
         tracing::info!("Generation candidate: {}", key);
         uuid::Uuid::parse_str(key).ok()
-    }
-
-    //FIXME: assumes that this bucket stores *only* generations,
-    // it should be more robust
-    fn find_newest_generation(&self) -> Option<uuid::Uuid> {
-        self.runtime
-            .block_on(async { self.find_newest_generation_async().await })
     }
 
     async fn get_remote_change_counter(&self, generation: &uuid::Uuid) -> Result<[u8; 4]> {
@@ -354,7 +335,9 @@ impl Replicator {
         let mut decompress_reader = async_compression::tokio::bufread::GzipDecoder::new(
             tokio::io::BufReader::new(body_reader),
         );
-        tokio::fs::rename(&self.db_path, format!("{}.bottomless.backup", self.db_path)).await.ok(); // Best effort
+        tokio::fs::rename(&self.db_path, format!("{}.bottomless.backup", self.db_path))
+            .await
+            .ok(); // Best effort
         let mut main_db_writer = tokio::fs::File::create(&self.db_path).await?;
         tokio::io::copy(&mut decompress_reader, &mut main_db_writer).await?;
         main_db_writer.flush().await?;
@@ -424,8 +407,8 @@ impl Replicator {
         Ok::<RestoreAction, anyhow::Error>(RestoreAction::SnapshotMainDbFile)
     }
 
-    pub fn restore(&self) -> Result<RestoreAction> {
-        let newest_generation = match self.find_newest_generation() {
+    pub async fn restore(&self) -> Result<RestoreAction> {
+        let newest_generation = match self.find_newest_generation().await {
             Some(gen) => gen,
             None => {
                 tracing::info!("No generation found, nothing to restore");
@@ -434,7 +417,6 @@ impl Replicator {
         };
 
         tracing::info!("Restoring from generation {}", newest_generation);
-        self.runtime
-            .block_on(async { self.restore_from(newest_generation).await })
+        self.restore_from(newest_generation).await
     }
 }

@@ -219,6 +219,7 @@ pub struct libsql_wal_methods {
     // User data
     pub underlying_methods: *const libsql_wal_methods,
     pub replicator: crate::replicator::Replicator,
+    pub runtime: tokio::runtime::Runtime,
 }
 
 #[repr(C)]

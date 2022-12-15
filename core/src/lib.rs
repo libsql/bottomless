@@ -116,7 +116,10 @@ pub extern "C" fn xFrames(
         methods.replicator.write(pgno, data);
     }
     if is_commit != 0 {
-        match methods.replicator.commit() {
+        let result = methods
+            .runtime
+            .block_on(async { methods.replicator.commit().await });
+        match result {
             Ok(()) => (),
             Err(e) => {
                 tracing::error!("Failed to replicate: {}", e);
@@ -200,7 +203,10 @@ pub extern "C" fn xCheckpoint(
 
     methods.replicator.new_generation();
     tracing::debug!("Snapshotting after checkpoint");
-    match methods.replicator.snapshot_main_db_file() {
+    let result = methods
+        .runtime
+        .block_on(async { methods.replicator.snapshot_main_db_file().await });
+    match result {
         Ok(()) => (),
         Err(e) => {
             tracing::error!(
@@ -267,28 +273,29 @@ pub extern "C" fn xPreMainDbOpen(methods: *mut libsql_wal_methods, path: *const 
 
     replicator.register_db(path);
 
-    match replicator.restore() {
-        Ok(replicator::RestoreAction::None) => (),
-        Ok(replicator::RestoreAction::SnapshotMainDbFile) => {
-            //FIXME: decide whether it's a good place
-            match replicator.snapshot_main_db_file() {
-                Ok(()) => (),
-                Err(e) => {
-                    tracing::error!("Failed to snapshot the main db file: {}", e);
-                    return ffi::SQLITE_CANTOPEN;
+    methods.runtime.block_on(async {
+        match replicator.restore().await {
+            Ok(replicator::RestoreAction::None) => (),
+            Ok(replicator::RestoreAction::SnapshotMainDbFile) => {
+                match replicator.snapshot_main_db_file().await {
+                    Ok(()) => (),
+                    Err(e) => {
+                        tracing::error!("Failed to snapshot the main db file: {}", e);
+                        return ffi::SQLITE_CANTOPEN;
+                    }
                 }
             }
+            Ok(replicator::RestoreAction::ReuseGeneration(gen)) => {
+                replicator.set_generation(gen);
+            }
+            Err(e) => {
+                tracing::error!("Failed to restore the database: {}", e);
+                return ffi::SQLITE_CANTOPEN;
+            }
         }
-        Ok(replicator::RestoreAction::ReuseGeneration(gen)) => {
-            replicator.set_generation(gen);
-        }
-        Err(e) => {
-            tracing::error!("Failed to restore the database: {}", e);
-            return ffi::SQLITE_CANTOPEN;
-        }
-    }
 
-    ffi::SQLITE_OK
+        ffi::SQLITE_OK
+    })
 }
 
 #[no_mangle]
@@ -303,7 +310,20 @@ pub extern "C" fn bottomless_methods(
     underlying_methods: *const libsql_wal_methods,
 ) -> *const libsql_wal_methods {
     let vwal_name: *const u8 = "bottomless\0".as_ptr();
-    let replicator = match replicator::Replicator::new() {
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            tracing::error!("Failed to initialize async runtime: {}", e);
+            return std::ptr::null();
+        }
+    };
+
+    let replicator = runtime.block_on(async { replicator::Replicator::new().await });
+    let replicator = match replicator {
         Ok(repl) => repl,
         Err(e) => {
             tracing::error!("Failed to initialize replicator: {}", e);
@@ -348,5 +368,6 @@ pub extern "C" fn bottomless_methods(
         p_next: std::ptr::null(),
         underlying_methods,
         replicator,
+        runtime,
     }))
 }

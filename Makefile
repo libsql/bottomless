@@ -10,8 +10,8 @@ release:	prep bottomless.c core/src/lib.rs
 		-o target/x86_64-unknown-linux-gnu/release/bottomless.so
 
 prep:
-	( cd libsql && ./configure && make )
+	( cd libsql && make || ( ./configure && make ) )
 
 .PHONY: test
 test:	debug prep
-	( cd test && ./smoke_test.sh )
+	( cd test && ./restore_test.sh )
