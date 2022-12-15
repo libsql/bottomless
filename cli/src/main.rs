@@ -36,7 +36,7 @@ impl Replicator {
         })
     }
 
-    pub async fn list_generations(&self, limit: Option<u64>) -> Result<()> {
+    pub async fn list_generations(&self, limit: Option<u64>, verbose: bool) -> Result<()> {
         let mut next_marker = None;
         let mut limit = limit.unwrap_or(u64::MAX);
         loop {
@@ -60,25 +60,24 @@ impl Replicator {
                 }
             };
 
-            println!("----------------------------------------------------------------------");
-            println!("|                                 Generations                        |");
-            println!("----------------------------------------------------------------------");
-            println!("|                uuid                  |         created at          |");
-            println!("----------------------------------------------------------------------");
             for prefix in prefixes {
                 if let Some(prefix) = &prefix.prefix {
                     let prefix = &prefix[self.db_name.len() + 1..prefix.len() - 1];
                     let uuid = uuid::Uuid::try_parse(prefix)?;
-                    let date = uuid_to_date(&uuid);
-                    println!("| {} | {:>24} UTC |", uuid, date);
+                    println!("{}", uuid);
+                    if verbose {
+                        let counter = self.get_remote_change_counter(&uuid).await?;
+                        let consistent_frame = self.get_last_consistent_frame(&uuid).await?;
+                        println!("\tcreated at (UTC):     {}", uuid_to_date(&uuid));
+                        println!("\tchange counter:       {:?}", counter);
+                        println!("\tconsistent WAL frame: {}", consistent_frame);
+                    }
                 }
                 limit -= 1;
                 if limit == 0 {
-                    println!("...");
                     return Ok(());
                 }
             }
-            println!("----------------------------------------------------------------------");
 
             next_marker = response.next_marker().map(|s| s.to_owned());
             if next_marker.is_none() {
@@ -132,6 +131,8 @@ enum Commands {
         generation: Option<uuid::Uuid>,
         #[clap(long, short)]
         limit: Option<u64>,
+        #[clap(long, short)]
+        verbose: bool,
     },
     Restore {
         #[clap(long, short)]
@@ -152,9 +153,13 @@ async fn main() {
     client.register_db(options.database);
 
     match options.command {
-        Commands::Ls { generation, limit } => match generation {
+        Commands::Ls {
+            generation,
+            limit,
+            verbose,
+        } => match generation {
             Some(gen) => client.list_generation(gen).await.unwrap(),
-            None => client.list_generations(limit).await.unwrap(),
+            None => client.list_generations(limit, verbose).await.unwrap(),
         },
         Commands::Restore { generation } => {
             match generation {
