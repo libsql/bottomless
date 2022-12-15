@@ -220,7 +220,7 @@ impl Replicator {
 
     //FIXME: assumes that this bucket stores *only* generations,
     // it should be more robust
-    async fn find_newest_generation(&self) -> Option<uuid::Uuid> {
+    pub async fn find_newest_generation(&self) -> Option<uuid::Uuid> {
         let response = self.list_objects().max_keys(1).send().await.ok()?;
         let objs = response.contents()?;
         let key = objs.first()?.key()?;
@@ -232,7 +232,7 @@ impl Replicator {
         uuid::Uuid::parse_str(key).ok()
     }
 
-    async fn get_remote_change_counter(&self, generation: &uuid::Uuid) -> Result<[u8; 4]> {
+    pub async fn get_remote_change_counter(&self, generation: &uuid::Uuid) -> Result<[u8; 4]> {
         use bytes::Buf;
         let mut remote_change_counter = [0u8; 4];
         if let Ok(response) = self
@@ -249,7 +249,7 @@ impl Replicator {
         Ok(remote_change_counter)
     }
 
-    async fn get_last_consistent_frame(&self, generation: &uuid::Uuid) -> Result<u32> {
+    pub async fn get_last_consistent_frame(&self, generation: &uuid::Uuid) -> Result<u32> {
         use bytes::Buf;
         Ok(
             match self

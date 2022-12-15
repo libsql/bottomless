@@ -19,6 +19,16 @@ impl std::ops::DerefMut for Replicator {
     }
 }
 
+fn uuid_to_date(uuid: &uuid::Uuid) -> chrono::NaiveDateTime {
+    let (seconds, nanos) = uuid
+        .get_timestamp()
+        .map(|ts| ts.to_unix())
+        .unwrap_or((0, 0));
+    let (seconds, nanos) = (253370761200 - seconds, 999000000 - nanos);
+    chrono::NaiveDateTime::from_timestamp_opt(seconds as i64, nanos)
+        .unwrap_or(chrono::NaiveDateTime::MIN)
+}
+
 impl Replicator {
     pub async fn new() -> Result<Self> {
         Ok(Self {
@@ -26,7 +36,7 @@ impl Replicator {
         })
     }
 
-    pub async fn list_generations(&self, db: &str, limit: Option<u64>) -> Result<()> {
+    pub async fn list_generations(&self, limit: Option<u64>) -> Result<()> {
         let mut next_marker = None;
         let mut limit = limit.unwrap_or(u64::MAX);
         loop {
@@ -35,7 +45,7 @@ impl Replicator {
                 .list_objects()
                 .bucket(&self.bucket)
                 .set_delimiter(Some("/".to_string()))
-                .prefix(db);
+                .prefix(&self.db_name);
 
             if let Some(marker) = next_marker {
                 list_request = list_request.marker(marker)
@@ -51,21 +61,15 @@ impl Replicator {
             };
 
             println!("----------------------------------------------------------------------");
-            println!("|                             Generations                            |");
+            println!("|                                 Generations                        |");
             println!("----------------------------------------------------------------------");
             println!("|                uuid                  |         created at          |");
             println!("----------------------------------------------------------------------");
             for prefix in prefixes {
                 if let Some(prefix) = &prefix.prefix {
-                    let prefix = &prefix[db.len() + 1..prefix.len() - 1];
+                    let prefix = &prefix[self.db_name.len() + 1..prefix.len() - 1];
                     let uuid = uuid::Uuid::try_parse(prefix)?;
-                    let (seconds, nanos) = uuid
-                        .get_timestamp()
-                        .map(|ts| ts.to_unix())
-                        .unwrap_or((0, 0));
-                    let (seconds, nanos) = (253370761200 - seconds, 999000000 - nanos);
-                    let date = chrono::NaiveDateTime::from_timestamp_opt(seconds as i64, nanos)
-                        .unwrap_or(chrono::NaiveDateTime::MIN);
+                    let date = uuid_to_date(&uuid);
                     println!("| {} | {:>24} UTC |", uuid, date);
                 }
                 limit -= 1;
@@ -83,9 +87,29 @@ impl Replicator {
         }
     }
 
-    //pub async fn list_generation(&self, db: &str, generation: &str) -> Result<()> {
+    pub async fn list_generation(&self, generation: uuid::Uuid) -> Result<()> {
+        self.client
+            .list_objects()
+            .bucket(&self.bucket)
+            .prefix(format!("{}-{}/", &self.db_name, generation))
+            .max_keys(1)
+            .send()
+            .await?
+            .contents()
+            .ok_or(anyhow::anyhow!(
+                "Generation {} not found for {}",
+                generation,
+                &self.db_name
+            ))?;
 
-    //}
+        let counter = self.get_remote_change_counter(&generation).await?;
+        let consistent_frame = self.get_last_consistent_frame(&generation).await?;
+        println!("Generation {} for {}", generation, self.db_name);
+        println!("\tcreated at:           {}", uuid_to_date(&generation));
+        println!("\tchange counter:       {:?}", counter);
+        println!("\tconsistent WAL frame: {}", consistent_frame);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -102,38 +126,40 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    #[clap(about="List available generations")]
+    #[clap(about = "List available generations")]
     Ls {
+        #[clap(long, short)]
+        generation: Option<uuid::Uuid>,
         #[clap(long, short)]
         limit: Option<u64>,
     },
     Restore {
         #[clap(long, short)]
         generation: Option<uuid::Uuid>,
-    }
+    },
 }
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
     let options = Cli::parse();
-    
+
     if let Some(ep) = options.endpoint {
         std::env::set_var("LIBSQL_BOTTOMLESS_ENDPOINT", ep)
     }
-    let database = &options.database;
 
     let mut client = Replicator::new().await.unwrap();
-    client.register_db(database);
+    client.register_db(options.database);
 
     match options.command {
-        Commands::Ls { limit } => {
-            client.list_generations(database, limit).await.unwrap()
+        Commands::Ls { generation, limit } => match generation {
+            Some(gen) => client.list_generation(gen).await.unwrap(),
+            None => client.list_generations(limit).await.unwrap(),
         },
         Commands::Restore { generation } => {
             match generation {
                 Some(gen) => client.restore_from(gen).await.unwrap(),
-                None => client.restore().await.unwrap()
+                None => client.restore().await.unwrap(),
             };
         }
     }
