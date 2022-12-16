@@ -10,6 +10,7 @@ pub struct Replicator {
     pub client: Client,
     write_buffer: HashMap<u32, (i32, BytesMut)>,
 
+    pub page_size: usize,
     generation: uuid::Uuid,
     next_frame: u32,
     pub bucket: String,
@@ -31,10 +32,7 @@ pub enum RestoreAction {
 }
 
 impl Replicator {
-    // FIXME: this should be derived from the database config
-    // and preserved somewhere in order to only restore from
-    // matching page size.
-    pub const PAGE_SIZE: usize = 4096;
+    pub const DEFAULT_PAGE_SIZE: usize = 4096;
 
     pub async fn new() -> Result<Self> {
         let write_buffer = HashMap::new();
@@ -51,6 +49,7 @@ impl Replicator {
             client,
             write_buffer,
             bucket,
+            page_size: Self::DEFAULT_PAGE_SIZE,
             generation,
             /* NOTICE: Next frame is 1 only if we always start from
              ** a fresh snapshot of a database file with an empty WAL.
@@ -62,6 +61,12 @@ impl Replicator {
             db_path: String::new(),
             db_name: String::new(),
         })
+    }
+
+    // The database can use different page size - as soon as it's known,
+    // it should be communicated to the replicator via this call.
+    pub fn set_page_size(&mut self, page_size: usize) {
+        self.page_size = page_size
     }
 
     fn get_object(&self, key: String) -> aws_sdk_s3::client::fluent_builders::GetObject {
@@ -127,7 +132,7 @@ impl Replicator {
         tracing::info!("Write buffer size: {}", self.write_buffer.len());
         let tasks = self.write_buffer.iter().map(|(frame, (pgno, bytes))| {
             let data: &[u8] = bytes;
-            if data.len() != Self::PAGE_SIZE {
+            if data.len() != self.page_size {
                 tracing::warn!("Unexpected truncated page of size {}", data.len())
             }
             // NOTICE: Current format is <generation>/<db-name>-<frame-number>-<page-number>
@@ -206,8 +211,8 @@ impl Replicator {
             tracing::info!("Local WAL is empty, not replicating");
             return Ok(());
         }
-        tracing::info!("Local WAL pages: {}", (len - 32) / Self::PAGE_SIZE as u64);
-        for offset in (32..len).step_by(Self::PAGE_SIZE + 24) {
+        tracing::info!("Local WAL pages: {}", (len - 32) / self.page_size as u64);
+        for offset in (32..len).step_by(self.page_size + 24) {
             wal_file.seek(tokio::io::SeekFrom::Start(offset)).await?;
             let pgno = wal_file.read_i32().await?;
             let size_after_transaction = wal_file.read_i32().await?;
@@ -219,7 +224,7 @@ impl Replicator {
             wal_file
                 .seek(tokio::io::SeekFrom::Start(offset + 24))
                 .await?;
-            let mut data = [0u8; Self::PAGE_SIZE];
+            let mut data = vec![0u8; self.page_size];
             wal_file.read_exact(&mut data).await?;
             self.write(pgno, &data);
             // In multi-page transactions, only the last page in the transaction contains
@@ -330,7 +335,7 @@ impl Replicator {
                     Err(_) => return 0,
                 };
                 // Each WAL file consists of a 32-byte WAL header and N entries of size (page size + 24)
-                (metadata.len() / (Self::PAGE_SIZE + 24) as u64) as u32
+                (metadata.len() / (self.page_size + 24) as u64) as u32
             }
             Err(_) => 0,
         }
@@ -442,7 +447,7 @@ impl Replicator {
                     break;
                 }
                 let mut data = frame.body.into_async_read();
-                let offset = pgno as u64 * Self::PAGE_SIZE as u64;
+                let offset = pgno as u64 * self.page_size as u64;
                 main_db_writer
                     .seek(tokio::io::SeekFrom::Start(offset))
                     .await?;

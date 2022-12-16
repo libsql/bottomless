@@ -112,6 +112,7 @@ pub extern "C" fn xFrames(
 ) -> i32 {
     let methods = get_methods(wal);
     let orig_methods = get_orig_methods(wal);
+    methods.replicator.set_page_size(page_size as usize);
     for (pgno, data) in ffi::PageHdrIter::new(page_headers, page_size as usize) {
         methods.replicator.write(pgno, data);
     }
