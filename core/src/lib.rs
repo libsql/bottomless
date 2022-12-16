@@ -16,9 +16,12 @@ pub extern "C" fn xOpen(
     methods: *mut libsql_wal_methods,
     wal: *mut *const Wal,
 ) -> i32 {
-    tracing::warn!("Opening WAL {}", unsafe {
+    tracing::debug!("Opening WAL {}", unsafe {
         std::ffi::CStr::from_ptr(wal_name).to_str().unwrap()
     });
+    // FIXME: return error if non-standard VFS is used,
+    // or remove this comment once the implementation becomes
+    // independent of VFS used.
     let orig_methods = unsafe { &*(*methods).underlying_methods };
     (orig_methods.xOpen)(vfs, db_file, wal_name, no_shm_mode, max_size, methods, wal)
 }
@@ -112,6 +115,11 @@ pub extern "C" fn xFrames(
 ) -> i32 {
     let methods = get_methods(wal);
     let orig_methods = get_orig_methods(wal);
+    // In theory it's enough to set the page size only once, but in practice
+    // it's a very cheap operation anyway, and the page is not always known
+    // upfront and can change dynamically.
+    // FIXME: changing the page size in the middle of operation is *not*
+    // supported by bottomless storage.
     methods.replicator.set_page_size(page_size as usize);
     for (pgno, data) in ffi::PageHdrIter::new(page_headers, page_size as usize) {
         methods.replicator.write(pgno, data);
