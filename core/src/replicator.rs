@@ -132,6 +132,7 @@ impl Replicator {
         tracing::info!("Write buffer size: {}", self.write_buffer.len());
         let tasks = self.write_buffer.iter().map(|(frame, (pgno, bytes))| {
             let data: &[u8] = bytes;
+            // TODO: compress here
             if data.len() != self.page_size {
                 tracing::warn!("Unexpected truncated page of size {}", data.len())
             }
@@ -447,6 +448,7 @@ impl Replicator {
                     break;
                 }
                 let mut data = frame.body.into_async_read();
+                //TODO: decompress here
                 let offset = pgno as u64 * self.page_size as u64;
                 main_db_writer
                     .seek(tokio::io::SeekFrom::Start(offset))
