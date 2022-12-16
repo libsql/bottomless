@@ -19,7 +19,7 @@ impl std::ops::DerefMut for Replicator {
     }
 }
 
-fn uuid_to_date(uuid: &uuid::Uuid) -> chrono::NaiveDateTime {
+fn uuid_to_datetime(uuid: &uuid::Uuid) -> chrono::NaiveDateTime {
     let (seconds, nanos) = uuid
         .get_timestamp()
         .map(|ts| ts.to_unix())
@@ -36,7 +36,13 @@ impl Replicator {
         })
     }
 
-    pub async fn list_generations(&self, limit: Option<u64>, verbose: bool) -> Result<()> {
+    pub async fn list_generations(
+        &self,
+        limit: Option<u64>,
+        older_than: Option<chrono::NaiveDate>,
+        newer_than: Option<chrono::NaiveDate>,
+        verbose: bool,
+    ) -> Result<()> {
         let mut next_marker = None;
         let mut limit = limit.unwrap_or(u64::MAX);
         loop {
@@ -64,11 +70,18 @@ impl Replicator {
                 if let Some(prefix) = &prefix.prefix {
                     let prefix = &prefix[self.db_name.len() + 1..prefix.len() - 1];
                     let uuid = uuid::Uuid::try_parse(prefix)?;
+                    let datetime = uuid_to_datetime(&uuid);
+                    if datetime.date() < newer_than.unwrap_or(chrono::NaiveDate::MIN) {
+                        continue;
+                    }
+                    if datetime.date() > older_than.unwrap_or(chrono::NaiveDate::MAX) {
+                        continue;
+                    }
                     println!("{}", uuid);
                     if verbose {
                         let counter = self.get_remote_change_counter(&uuid).await?;
                         let consistent_frame = self.get_last_consistent_frame(&uuid).await?;
-                        println!("\tcreated at (UTC):     {}", uuid_to_date(&uuid));
+                        println!("\tcreated at (UTC):     {}", datetime);
                         println!("\tchange counter:       {:?}", counter);
                         println!("\tconsistent WAL frame: {}", consistent_frame);
                     }
@@ -77,6 +90,40 @@ impl Replicator {
                 if limit == 0 {
                     return Ok(());
                 }
+            }
+
+            next_marker = response.next_marker().map(|s| s.to_owned());
+            if next_marker.is_none() {
+                return Ok(());
+            }
+        }
+    }
+
+    pub async fn remove(&self, generation: uuid::Uuid) -> Result<()> {
+        //TODO: Loop over all object with the generation prefix and drop them one by one
+        let mut next_marker = None;
+        loop {
+            let mut list_request = self
+                .client
+                .list_objects()
+                .bucket(&self.bucket)
+                .prefix(format!("{}-{}/", &self.db_name, generation));
+
+            if let Some(marker) = next_marker {
+                list_request = list_request.marker(marker)
+            }
+
+            let response = list_request.send().await?;
+            let objs = match response.contents() {
+                Some(prefixes) => prefixes,
+                None => {
+                    println!("No objects");
+                    return Ok(());
+                }
+            };
+
+            for obj in objs {
+                println!("Stub, but will remove {:?}", obj.key());
             }
 
             next_marker = response.next_marker().map(|s| s.to_owned());
@@ -104,7 +151,7 @@ impl Replicator {
         let counter = self.get_remote_change_counter(&generation).await?;
         let consistent_frame = self.get_last_consistent_frame(&generation).await?;
         println!("Generation {} for {}", generation, self.db_name);
-        println!("\tcreated at:           {}", uuid_to_date(&generation));
+        println!("\tcreated at:           {}", uuid_to_datetime(&generation));
         println!("\tchange counter:       {:?}", counter);
         println!("\tconsistent WAL frame: {}", consistent_frame);
         Ok(())
@@ -131,12 +178,20 @@ enum Commands {
         generation: Option<uuid::Uuid>,
         #[clap(long, short)]
         limit: Option<u64>,
+        #[clap(long)]
+        older_than: Option<chrono::NaiveDate>,
+        #[clap(long)]
+        newer_than: Option<chrono::NaiveDate>,
         #[clap(long, short)]
         verbose: bool,
     },
     Restore {
         #[clap(long, short)]
         generation: Option<uuid::Uuid>,
+    },
+    Rm {
+        #[clap(long, short)]
+        generation: uuid::Uuid,
     },
 }
 
@@ -156,10 +211,15 @@ async fn main() {
         Commands::Ls {
             generation,
             limit,
+            older_than,
+            newer_than,
             verbose,
         } => match generation {
             Some(gen) => client.list_generation(gen).await.unwrap(),
-            None => client.list_generations(limit, verbose).await.unwrap(),
+            None => client
+                .list_generations(limit, older_than, newer_than, verbose)
+                .await
+                .unwrap(),
         },
         Commands::Restore { generation } => {
             match generation {
@@ -167,5 +227,6 @@ async fn main() {
                 None => client.restore().await.unwrap(),
             };
         }
+        Commands::Rm { generation } => client.remove(generation).await.unwrap(),
     }
 }
