@@ -1,6 +1,7 @@
 use aws_sdk_s3::types::ByteStream;
 use aws_sdk_s3::{Client, Endpoint};
 use bytes::{Bytes, BytesMut};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 pub type Result<T> = anyhow::Result<T>;
@@ -45,6 +46,18 @@ impl Replicator {
         let client = Client::new(&loader.load().await);
         let generation = Self::generate_generation();
         tracing::debug!("Generation {}", generation);
+
+        match client.head_bucket().bucket(&bucket).send().await {
+            Ok(_) => tracing::info!("Bucket {} exists and is accessible", bucket),
+            Err(aws_sdk_s3::types::SdkError::ServiceError { err, raw: _ })
+                if err.is_not_found() =>
+            {
+                tracing::info!("Bucket {} not found, recreating", bucket);
+                client.create_bucket().bucket(&bucket).send().await?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+
         Ok(Self {
             client,
             write_buffer,
@@ -65,6 +78,8 @@ impl Replicator {
 
     // The database can use different page size - as soon as it's known,
     // it should be communicated to the replicator via this call.
+    // FIXME: we don't support dynamically changing page size, and SQLite,
+    // in general, does. It needs to be checked here.
     pub fn set_page_size(&mut self, page_size: usize) {
         self.page_size = page_size
     }
@@ -129,27 +144,39 @@ impl Replicator {
     // FIXME: Newest consistent frame number needs to be stored right after committing
     // in order to be able to recover from a partial commit later
     pub async fn commit(&mut self) -> Result<()> {
-        tracing::info!("Write buffer size: {}", self.write_buffer.len());
-        let tasks = self.write_buffer.iter().map(|(frame, (pgno, bytes))| {
+        tracing::debug!("Write buffer size: {}", self.write_buffer.len());
+        let mut tasks = vec![];
+        // FIXME: instead of batches processed in bursts, better to allow X concurrent tasks with a semaphore
+        const CONCURRENCY: usize = 16;
+        for (frame, (pgno, bytes)) in self.write_buffer.iter() {
             let data: &[u8] = bytes;
-            // TODO: compress here
             if data.len() != self.page_size {
                 tracing::warn!("Unexpected truncated page of size {}", data.len())
             }
-            // NOTICE: Current format is <generation>/<db-name>-<frame-number>-<page-number>
+            let mut compressor = async_compression::tokio::bufread::GzipEncoder::new(data);
+            let mut compressed: Vec<u8> = Vec::with_capacity(self.page_size);
+            tokio::io::copy(&mut compressor, &mut compressed).await?;
             let key = format!(
                 "{}-{}/{:012}-{:012}",
                 self.db_name, self.generation, frame, pgno
             );
-            tracing::info!("Committing {}", key);
-            self.client
-                .put_object()
-                .bucket(&self.bucket)
-                .key(key)
-                .body(ByteStream::from(data.to_owned()))
-                .send()
-        });
-        futures::future::try_join_all(tasks).await?;
+            tracing::info!("Committing {} (compressed size: {})", key, compressed.len());
+            tasks.push(
+                self.client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .body(ByteStream::from(compressed))
+                    .send(),
+            );
+            if tasks.len() >= CONCURRENCY {
+                futures::future::try_join_all(std::mem::take(&mut tasks)).await?;
+                tasks.clear();
+            }
+        }
+        if !tasks.is_empty() {
+            futures::future::try_join_all(tasks).await?;
+        }
         self.write_buffer.clear();
         // Last consistent frame is persisted in S3 in order to be able to recover
         // from failured that happen in the middle of a commit, when only some
@@ -345,7 +372,7 @@ impl Replicator {
     fn parse_frame_and_page_numbers(key: &str) -> Option<(u32, i32)> {
         // Format: <generation>/<db-name>-<frame-number>-<page-number>
         let page_delim = key.rfind('-')?;
-        let frame_delim = key[0..page_delim].rfind('-')?;
+        let frame_delim = key[0..page_delim].rfind('/')?;
         let frameno = key[frame_delim + 1..page_delim].parse::<u32>().ok()?;
         let pgno = key[page_delim + 1..].parse::<i32>().ok()?;
         Some((frameno, pgno))
@@ -357,7 +384,7 @@ impl Replicator {
         // Check if the database needs to be restored by inspecting the database
         // change counter and the WAL size.
         let local_change_counter = match tokio::fs::File::open(&self.db_path).await {
-            Ok(mut db) => Self::read_change_counter(&mut db).await?,
+            Ok(mut db) => Self::read_change_counter(&mut db).await.unwrap_or([0u8; 4]),
             Err(_) => [0u8; 4],
         };
 
@@ -371,23 +398,33 @@ impl Replicator {
         let last_consistent_frame = self.get_last_consistent_frame(&generation).await?;
         tracing::info!("Last consistent remote frame: {}", last_consistent_frame);
 
-        if local_change_counter == remote_change_counter {
-            let wal_pages = self.get_wal_page_count().await;
-            tracing::warn!(
-                "Consistent: {}; wal pages: {}",
-                last_consistent_frame,
-                wal_pages
-            );
-            if wal_pages == last_consistent_frame {
-                tracing::warn!("Remote generation is up-to-date, reusing it in this session");
-                return Ok(RestoreAction::ReuseGeneration(generation));
-            } else if wal_pages > last_consistent_frame {
-                tracing::warn!("Local change counter matches the remote one, but local WAL contains newer data, which needs to be replicated");
+        match local_change_counter.cmp(&remote_change_counter) {
+            Ordering::Equal => {
+                let wal_pages = self.get_wal_page_count().await;
+                tracing::warn!(
+                    "Consistent: {}; wal pages: {}",
+                    last_consistent_frame,
+                    wal_pages
+                );
+                match wal_pages.cmp(&last_consistent_frame) {
+                    Ordering::Equal => {
+                        tracing::warn!(
+                            "Remote generation is up-to-date, reusing it in this session"
+                        );
+                        return Ok(RestoreAction::ReuseGeneration(generation));
+                    }
+                    Ordering::Greater => {
+                        tracing::warn!("Local change counter matches the remote one, but local WAL contains newer data, which needs to be replicated");
+                        return Ok(RestoreAction::SnapshotMainDbFile);
+                    }
+                    Ordering::Less => (),
+                }
+            }
+            Ordering::Greater => {
+                tracing::warn!("Local change counter is larger than its remote counterpart - a new snapshot needs to be replicated");
                 return Ok(RestoreAction::SnapshotMainDbFile);
             }
-        } else if local_change_counter > remote_change_counter {
-            tracing::warn!("Local change counter is larger than its remote counterpart - a new snapshot needs to be replicated");
-            return Ok(RestoreAction::SnapshotMainDbFile);
+            Ordering::Less => (),
         }
 
         let db_file = self
@@ -408,8 +445,6 @@ impl Replicator {
 
         let mut next_marker = None;
         let prefix = format!("{}-{}/", self.db_name, generation);
-        // FIXME: consider what to do with WAL present - if the change counters
-        // match and checksums do too, some of it could be applied locally first
         tracing::warn!("Overwriting any existing WAL file: {}-wal", &self.db_path);
         tokio::fs::remove_file(&format!("{}-wal", &self.db_path))
             .await
@@ -425,20 +460,22 @@ impl Replicator {
             let response = list_request.send().await?;
             let objs = match response.contents() {
                 Some(objs) => objs,
-                None => break,
+                None => {
+                    tracing::trace!("No objects found in generation {}", generation);
+                    break;
+                }
             };
-            //TODO: consider higher concurrency
             for obj in objs {
                 let key = obj
                     .key()
                     .ok_or_else(|| anyhow::anyhow!("Failed to get key for an object"))?;
-                tracing::debug!("Loading {}", key);
+                tracing::info!("Loading {}", key);
                 let frame = self.get_object(key.into()).send().await?;
 
                 let (frameno, pgno) = match Self::parse_frame_and_page_numbers(key) {
                     Some(result) => result,
                     None => {
-                        tracing::debug!("Failed to parse frame/page from key {}", key);
+                        tracing::trace!("Failed to parse frame/page from key {}", key);
                         continue;
                     }
                 };
@@ -447,17 +484,25 @@ impl Replicator {
                                 frameno, last_consistent_frame);
                     break;
                 }
-                let mut data = frame.body.into_async_read();
-                //TODO: decompress here
-                let offset = pgno as u64 * self.page_size as u64;
+                let body_reader = frame.body.into_async_read();
+                let mut decompress_reader = async_compression::tokio::bufread::GzipDecoder::new(
+                    tokio::io::BufReader::new(body_reader),
+                );
+                let offset = (pgno - 1) as u64 * self.page_size as u64;
                 main_db_writer
                     .seek(tokio::io::SeekFrom::Start(offset))
                     .await?;
                 // FIXME: we only need to overwrite with the newest page,
                 // no need to replay the whole WAL
-                tokio::io::copy(&mut data, &mut main_db_writer).await?;
+                let copied = tokio::io::copy(&mut decompress_reader, &mut main_db_writer).await?;
                 main_db_writer.flush().await?;
-                tracing::info!("Written frame {} as main db page {}", frameno, pgno);
+                tracing::info!(
+                    "Written frame {} as main db page {} ({} bytes, at offset {})",
+                    frameno,
+                    pgno,
+                    copied,
+                    offset,
+                );
             }
             next_marker = response
                 .is_truncated()

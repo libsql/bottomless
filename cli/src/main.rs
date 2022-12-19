@@ -142,11 +142,9 @@ impl Replicator {
             .send()
             .await?
             .contents()
-            .ok_or(anyhow::anyhow!(
-                "Generation {} not found for {}",
-                generation,
-                &self.db_name
-            ))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("Generation {} not found for {}", generation, &self.db_name)
+            })?;
 
         let counter = self.get_remote_change_counter(&generation).await?;
         let consistent_frame = self.get_last_consistent_frame(&generation).await?;
