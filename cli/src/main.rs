@@ -93,7 +93,7 @@ impl Replicator {
             let prefixes = match response.common_prefixes() {
                 Some(prefixes) => prefixes,
                 None => {
-                    println!("No prefixes");
+                    println!("No generations found");
                     return Ok(());
                 }
             };
@@ -133,8 +133,7 @@ impl Replicator {
         }
     }
 
-    pub async fn remove(&self, generation: uuid::Uuid) -> Result<()> {
-        //TODO: Loop over all object with the generation prefix and drop them one by one
+    pub async fn remove(&self, generation: uuid::Uuid, verbose: bool) -> Result<()> {
         let mut next_marker = None;
         loop {
             let mut list_request = self
@@ -151,13 +150,25 @@ impl Replicator {
             let objs = match response.contents() {
                 Some(prefixes) => prefixes,
                 None => {
-                    println!("No objects");
+                    if verbose {
+                        println!("No objects found")
+                    }
                     return Ok(());
                 }
             };
 
             for obj in objs {
-                println!("Stub, but will remove {:?}", obj.key());
+                if let Some(key) = obj.key() {
+                    if verbose {
+                        println!("Removing {}", key)
+                    }
+                    self.client
+                        .delete_object()
+                        .bucket(&self.bucket)
+                        .key(key)
+                        .send()
+                        .await?;
+                }
             }
 
             next_marker = response.next_marker().map(|s| s.to_owned());
@@ -165,6 +176,59 @@ impl Replicator {
                 return Ok(());
             }
         }
+    }
+
+    pub async fn remove_many(&self, older_than: chrono::NaiveDate, verbose: bool) -> Result<()> {
+        let mut next_marker = None;
+        let mut removed_count = 0;
+        loop {
+            let mut list_request = self
+                .client
+                .list_objects()
+                .bucket(&self.bucket)
+                .set_delimiter(Some("/".to_string()))
+                .prefix(&self.db_name);
+
+            if let Some(marker) = next_marker {
+                list_request = list_request.marker(marker)
+            }
+
+            let response = list_request.send().await?;
+            let prefixes = match response.common_prefixes() {
+                Some(prefixes) => prefixes,
+                None => {
+                    if verbose {
+                        println!("No generations found")
+                    }
+                    return Ok(());
+                }
+            };
+
+            for prefix in prefixes {
+                if let Some(prefix) = &prefix.prefix {
+                    let prefix = &prefix[self.db_name.len() + 1..prefix.len() - 1];
+                    let uuid = uuid::Uuid::try_parse(prefix)?;
+                    let datetime = uuid_to_datetime(&uuid);
+                    if datetime.date() >= older_than {
+                        continue;
+                    }
+                    if verbose {
+                        println!("Removing {}", uuid);
+                    }
+                    self.remove(uuid, verbose).await?;
+                    removed_count += 1;
+                }
+            }
+
+            next_marker = response.next_marker().map(|s| s.to_owned());
+            if next_marker.is_none() {
+                break;
+            }
+        }
+        if verbose {
+            println!("Removed {} generations", removed_count);
+        }
+        Ok(())
     }
 
     pub async fn list_generation(&self, generation: uuid::Uuid) -> Result<()> {
@@ -247,7 +311,15 @@ enum Commands {
     #[clap(about = "Remove given generation from remote storage")]
     Rm {
         #[clap(long, short)]
-        generation: uuid::Uuid,
+        generation: Option<uuid::Uuid>,
+        #[clap(
+            long,
+            conflicts_with = "generation",
+            long_help = "Remove generations older than given date"
+        )]
+        older_than: Option<chrono::NaiveDate>,
+        #[clap(long, short)]
+        verbose: bool,
     },
 }
 
@@ -283,6 +355,17 @@ async fn main() {
                 None => client.restore().await.unwrap(),
             };
         }
-        Commands::Rm { generation } => client.remove(generation).await.unwrap(),
+        Commands::Rm {
+            generation,
+            older_than,
+            verbose,
+        } => match (generation, older_than) {
+            (None, Some(older_than)) => client.remove_many(older_than, verbose).await.unwrap(),
+            (Some(generation), None) => client.remove(generation, verbose).await.unwrap(),
+            (Some(_), Some(_)) => unreachable!(),
+            (None, None) => println!(
+                "rm command cannot be run without parameters; see -h or --help for details"
+            ),
+        },
     }
 }
