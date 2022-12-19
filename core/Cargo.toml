@@ -1,10 +1,10 @@
 [package]
 name = "bottomless"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 license = "MIT"
 keywords = ["libsql", "sqlite", "s3", "wal", "replication"]
-repository = "https://github.com/psarna/bottomless"
+repository = "https://github.com/libsql/bottomless"
 description = "Bottomless replication for libSQL"
 
 [dependencies]
