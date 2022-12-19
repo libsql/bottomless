@@ -177,7 +177,7 @@ pub extern "C" fn xCheckpoint(
      ** An alternative to consider is to just refuse passive checkpoints.
      */
     let emode = if emode < ffi::SQLITE_CHECKPOINT_FULL {
-        tracing::info!("Upgrading passive checkpoint to FULL mode");
+        tracing::debug!("Upgrading passive checkpoint to FULL mode");
         ffi::SQLITE_CHECKPOINT_FULL
     } else {
         emode
@@ -186,7 +186,7 @@ pub extern "C" fn xCheckpoint(
      ** since we auto-upgrade the passive checkpoint
      */
     let busy_handler = if (busy_handler as *const c_void).is_null() {
-        tracing::info!("Falling back to the default busy handler - always wait");
+        tracing::debug!("Falling back to the default busy handler - always wait");
         always_wait
     } else {
         busy_handler
@@ -211,7 +211,7 @@ pub extern "C" fn xCheckpoint(
     }
 
     if methods.replicator.commits_in_current_generation == 0 {
-        tracing::info!("No commits happened in this generation, not snapshotting");
+        tracing::debug!("No commits happened in this generation, not snapshotting");
         return ffi::SQLITE_OK;
     }
 
@@ -281,7 +281,7 @@ pub extern "C" fn xPreMainDbOpen(methods: *mut libsql_wal_methods, path: *const 
             }
         }
     };
-    tracing::info!("Main database file {} will be open soon", path);
+    tracing::debug!("Main database file {} will be open soon", path);
     let methods = unsafe { &mut *methods };
     let replicator = &mut methods.replicator;
 

@@ -103,7 +103,7 @@ impl Replicator {
 
     pub fn set_generation(&mut self, generation: uuid::Uuid) {
         self.generation = generation;
-        tracing::info!("Generation set to {}", self.generation);
+        tracing::debug!("Generation set to {}", self.generation);
     }
 
     pub fn register_db(&mut self, db_path: impl Into<String>) {
@@ -115,11 +115,7 @@ impl Replicator {
         };
         self.db_path = db_path;
         self.db_name = name;
-        tracing::debug!(
-            "Registered name: {} (full path: {})",
-            self.db_name,
-            self.db_path
-        );
+        tracing::debug!("Registered {} (full path: {})", self.db_name, self.db_path);
     }
 
     pub fn next_frame(&mut self) -> u32 {
@@ -129,7 +125,7 @@ impl Replicator {
 
     pub fn write(&mut self, pgno: i32, data: &[u8]) {
         let frame = self.next_frame();
-        tracing::info!("Writing page {}:{} at frame {}", pgno, data.len(), frame);
+        tracing::trace!("Writing page {}:{} at frame {}", pgno, data.len(), frame);
         let mut bytes = BytesMut::new();
         bytes.extend_from_slice(data);
         self.write_buffer.insert(frame, (pgno, bytes));
@@ -154,7 +150,7 @@ impl Replicator {
                 "{}-{}/{:012}-{:012}",
                 self.db_name, self.generation, frame, pgno
             );
-            tracing::info!("Committing {} (compressed size: {})", key, compressed.len());
+            tracing::debug!("Committing {} (compressed size: {})", key, compressed.len());
             tasks.push(
                 self.client
                     .put_object()
@@ -176,7 +172,7 @@ impl Replicator {
         // from failured that happen in the middle of a commit, when only some
         // of the pages that belong to a transaction are replicated.
         let last_consistent_frame_key = format!("{}-{}/.consistent", self.db_name, self.generation);
-        tracing::info!("Last consistent frame: {}", self.next_frame - 1);
+        tracing::debug!("Last consistent frame: {}", self.next_frame - 1);
         self.client
             .put_object()
             .bucket(&self.bucket)
@@ -233,16 +229,12 @@ impl Replicator {
             tracing::info!("Local WAL is empty, not replicating");
             return Ok(());
         }
-        tracing::info!("Local WAL pages: {}", (len - 32) / self.page_size as u64);
+        tracing::trace!("Local WAL pages: {}", (len - 32) / self.page_size as u64);
         for offset in (32..len).step_by(self.page_size + 24) {
             wal_file.seek(tokio::io::SeekFrom::Start(offset)).await?;
             let pgno = wal_file.read_i32().await?;
-            let size_after_transaction = wal_file.read_i32().await?;
-            tracing::warn!(
-                "Size after transaction for {} is {}",
-                pgno,
-                size_after_transaction
-            );
+            let size_after = wal_file.read_i32().await?;
+            tracing::warn!("Size after transaction for {}: {}", pgno, size_after);
             wal_file
                 .seek(tokio::io::SeekFrom::Start(offset + 24))
                 .await?;
@@ -252,7 +244,7 @@ impl Replicator {
             // In multi-page transactions, only the last page in the transaction contains
             // the size_after_transaction field. If it's zero, it means it's an uncommited
             // page.
-            if size_after_transaction != 0 {
+            if size_after != 0 {
                 self.commit().await?;
             }
         }
@@ -269,7 +261,7 @@ impl Replicator {
     // counterpart.
     pub async fn snapshot_main_db_file(&mut self) -> Result<()> {
         if !std::path::Path::new(&self.db_path).exists() {
-            tracing::info!("Not snapshotting, the main db file does not exist");
+            tracing::debug!("Not snapshotting, the main db file does not exist");
             return Ok(());
         }
         tracing::debug!("Snapshotting {}", self.db_path);
@@ -313,7 +305,7 @@ impl Replicator {
             Some(index) => &key[self.db_name.len() + 1..index],
             None => key,
         };
-        tracing::info!("Generation candidate: {}", key);
+        tracing::debug!("Generation candidate: {}", key);
         uuid::Uuid::parse_str(key).ok()
     }
 
@@ -377,22 +369,18 @@ impl Replicator {
 
         // Check if the database needs to be restored by inspecting the database
         // change counter and the WAL size.
-        let local_change_counter = match tokio::fs::File::open(&self.db_path).await {
+        let local_counter = match tokio::fs::File::open(&self.db_path).await {
             Ok(mut db) => Self::read_change_counter(&mut db).await.unwrap_or([0u8; 4]),
             Err(_) => [0u8; 4],
         };
 
-        let remote_change_counter = self.get_remote_change_counter(&generation).await?;
-        tracing::info!(
-            "Counters: local={:?}, remote={:?}",
-            local_change_counter,
-            remote_change_counter
-        );
+        let remote_counter = self.get_remote_change_counter(&generation).await?;
+        tracing::debug!("Counters: l={:?}, r={:?}", local_counter, remote_counter);
 
         let last_consistent_frame = self.get_last_consistent_frame(&generation).await?;
-        tracing::info!("Last consistent remote frame: {}", last_consistent_frame);
+        tracing::debug!("Last consistent remote frame: {}", last_consistent_frame);
 
-        match local_change_counter.cmp(&remote_change_counter) {
+        match local_counter.cmp(&remote_counter) {
             Ordering::Equal => {
                 let wal_pages = self.get_wal_page_count().await;
                 tracing::debug!(
@@ -435,11 +423,11 @@ impl Replicator {
         let mut main_db_writer = tokio::fs::File::create(&self.db_path).await?;
         tokio::io::copy(&mut decompress_reader, &mut main_db_writer).await?;
         main_db_writer.flush().await?;
-        tracing::info!("Restored main db file");
+        tracing::info!("Restored the main database file");
 
         let mut next_marker = None;
         let prefix = format!("{}-{}/", self.db_name, generation);
-        tracing::warn!("Overwriting any existing WAL file: {}-wal", &self.db_path);
+        tracing::debug!("Overwriting any existing WAL file: {}-wal", &self.db_path);
         tokio::fs::remove_file(&format!("{}-wal", &self.db_path))
             .await
             .ok();
@@ -457,7 +445,7 @@ impl Replicator {
             let objs = match response.contents() {
                 Some(objs) => objs,
                 None => {
-                    tracing::trace!("No objects found in generation {}", generation);
+                    tracing::debug!("No objects found in generation {}", generation);
                     break;
                 }
             };
@@ -465,18 +453,18 @@ impl Replicator {
                 let key = obj
                     .key()
                     .ok_or_else(|| anyhow::anyhow!("Failed to get key for an object"))?;
-                tracing::info!("Loading {}", key);
+                tracing::debug!("Loading {}", key);
                 let frame = self.get_object(key.into()).send().await?;
 
                 let (frameno, pgno) = match Self::parse_frame_and_page_numbers(key) {
                     Some(result) => result,
                     None => {
-                        tracing::trace!("Failed to parse frame/page from key {}", key);
+                        tracing::debug!("Failed to parse frame/page from key {}", key);
                         continue;
                     }
                 };
                 if frameno > last_consistent_frame {
-                    tracing::warn!("Remote log contains frame {} larger than last consistent frame ({}), stopping the restoration",
+                    tracing::warn!("Remote log contains frame {} larger than last consistent frame ({}), stopping the restoration process",
                                 frameno, last_consistent_frame);
                     break;
                 }
@@ -490,15 +478,9 @@ impl Replicator {
                     .await?;
                 // FIXME: we only need to overwrite with the newest page,
                 // no need to replay the whole WAL
-                let copied = tokio::io::copy(&mut decompress_reader, &mut main_db_writer).await?;
+                tokio::io::copy(&mut decompress_reader, &mut main_db_writer).await?;
                 main_db_writer.flush().await?;
-                tracing::info!(
-                    "Written frame {} as main db page {} ({} bytes, at offset {})",
-                    frameno,
-                    pgno,
-                    copied,
-                    offset,
-                );
+                tracing::debug!("Written frame {} as main db page {}", frameno, pgno,);
                 applied_wal_frame = true;
             }
             next_marker = response
@@ -521,7 +503,7 @@ impl Replicator {
         let newest_generation = match self.find_newest_generation().await {
             Some(gen) => gen,
             None => {
-                tracing::info!("No generation found, nothing to restore");
+                tracing::debug!("No generation found, nothing to restore");
                 return Ok(RestoreAction::SnapshotMainDbFile);
             }
         };
