@@ -448,6 +448,8 @@ impl Replicator {
         tokio::fs::remove_file(&format!("{}-shm", &self.db_path))
             .await
             .ok();
+
+        let mut applied_wal_frame = false;
         loop {
             let mut list_request = self.list_objects().prefix(&prefix);
             if let Some(marker) = next_marker {
@@ -499,6 +501,7 @@ impl Replicator {
                     copied,
                     offset,
                 );
+                applied_wal_frame = true;
             }
             next_marker = response
                 .is_truncated()
@@ -509,7 +512,11 @@ impl Replicator {
             }
         }
 
-        Ok::<RestoreAction, anyhow::Error>(RestoreAction::SnapshotMainDbFile)
+        if applied_wal_frame {
+            Ok::<_, anyhow::Error>(RestoreAction::SnapshotMainDbFile)
+        } else {
+            Ok::<_, anyhow::Error>(RestoreAction::None)
+        }
     }
 
     pub async fn restore(&self) -> Result<RestoreAction> {
