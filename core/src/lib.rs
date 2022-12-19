@@ -210,6 +210,11 @@ pub extern "C" fn xCheckpoint(
         return rc;
     }
 
+    if methods.replicator.commits_in_current_generation == 0 {
+        tracing::info!("No commits happened in this generation, not snapshotting");
+        return ffi::SQLITE_OK;
+    }
+
     methods.replicator.new_generation();
     tracing::debug!("Snapshotting after checkpoint");
     let result = methods

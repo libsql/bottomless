@@ -13,6 +13,7 @@ pub struct Replicator {
 
     pub page_size: usize,
     generation: uuid::Uuid,
+    pub commits_in_current_generation: u32,
     next_frame: u32,
     pub bucket: String,
     pub db_path: String,
@@ -64,12 +65,7 @@ impl Replicator {
             bucket,
             page_size: Self::DEFAULT_PAGE_SIZE,
             generation,
-            /* NOTICE: Next frame is 1 only if we always start from
-             ** a fresh snapshot of a database file with an empty WAL.
-             ** If this is not enforced, next frame should be deduced
-             ** from the replicated contents - it's the first
-             ** unused frame number from the latest generation.
-             */
+            commits_in_current_generation: 0,
             next_frame: 1,
             db_path: String::new(),
             db_name: String::new(),
@@ -103,6 +99,7 @@ impl Replicator {
 
     pub fn new_generation(&mut self) {
         self.generation = Self::generate_generation();
+        self.commits_in_current_generation = 0;
         tracing::debug!("New generation started: {}", self.generation);
     }
 
@@ -141,10 +138,9 @@ impl Replicator {
     }
 
     // Sends the pages participating in a commit to S3
-    // FIXME: Newest consistent frame number needs to be stored right after committing
-    // in order to be able to recover from a partial commit later
     pub async fn commit(&mut self) -> Result<()> {
         tracing::debug!("Write buffer size: {}", self.write_buffer.len());
+        self.commits_in_current_generation += 1;
         let mut tasks = vec![];
         // FIXME: instead of batches processed in bursts, better to allow X concurrent tasks with a semaphore
         const CONCURRENCY: usize = 16;
@@ -401,27 +397,27 @@ impl Replicator {
         match local_change_counter.cmp(&remote_change_counter) {
             Ordering::Equal => {
                 let wal_pages = self.get_wal_page_count().await;
-                tracing::warn!(
+                tracing::debug!(
                     "Consistent: {}; wal pages: {}",
                     last_consistent_frame,
                     wal_pages
                 );
                 match wal_pages.cmp(&last_consistent_frame) {
                     Ordering::Equal => {
-                        tracing::warn!(
+                        tracing::info!(
                             "Remote generation is up-to-date, reusing it in this session"
                         );
                         return Ok(RestoreAction::ReuseGeneration(generation));
                     }
                     Ordering::Greater => {
-                        tracing::warn!("Local change counter matches the remote one, but local WAL contains newer data, which needs to be replicated");
+                        tracing::info!("Local change counter matches the remote one, but local WAL contains newer data, which needs to be replicated");
                         return Ok(RestoreAction::SnapshotMainDbFile);
                     }
                     Ordering::Less => (),
                 }
             }
             Ordering::Greater => {
-                tracing::warn!("Local change counter is larger than its remote counterpart - a new snapshot needs to be replicated");
+                tracing::info!("Local change counter is larger than its remote counterpart - a new snapshot needs to be replicated");
                 return Ok(RestoreAction::SnapshotMainDbFile);
             }
             Ordering::Less => (),
