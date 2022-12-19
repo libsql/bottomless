@@ -40,7 +40,7 @@ impl Replicator {
         let write_buffer = HashMap::new();
         let mut loader = aws_config::from_env();
         if let Ok(endpoint) = std::env::var("LIBSQL_BOTTOMLESS_ENDPOINT") {
-            loader = loader.endpoint_resolver(Endpoint::immutable(endpoint.parse()?));
+            loader = loader.endpoint_resolver(Endpoint::immutable(endpoint)?);
         }
         let bucket =
             std::env::var("LIBSQL_BOTTOMLESS_BUCKET").unwrap_or_else(|_| "bottomless".to_string());
@@ -50,9 +50,7 @@ impl Replicator {
 
         match client.head_bucket().bucket(&bucket).send().await {
             Ok(_) => tracing::info!("Bucket {} exists and is accessible", bucket),
-            Err(aws_sdk_s3::types::SdkError::ServiceError { err, raw: _ })
-                if err.is_not_found() =>
-            {
+            Err(aws_sdk_s3::types::SdkError::ServiceError(err)) if err.err().is_not_found() => {
                 tracing::info!("Bucket {} not found, recreating", bucket);
                 client.create_bucket().bucket(&bucket).send().await?;
             }

@@ -36,6 +36,38 @@ impl Replicator {
         })
     }
 
+    async fn print_snapshot_summary(&self, generation: &uuid::Uuid) -> Result<()> {
+        match self
+            .client
+            .get_object_attributes()
+            .bucket(&self.bucket)
+            .key(format!("{}-{}/db.gz", self.db_name, generation))
+            .object_attributes(aws_sdk_s3::model::ObjectAttributes::ObjectSize)
+            .send()
+            .await
+        {
+            Ok(attrs) => {
+                println!("\tmain database snapshot:");
+                println!("\t\tobject size:   {}", attrs.object_size());
+                println!(
+                    "\t\tlast modified: {}",
+                    attrs
+                        .last_modified()
+                        .map(|s| s
+                            .fmt(aws_smithy_types::date_time::Format::DateTime)
+                            .unwrap_or_else(|e| e.to_string()))
+                        .as_deref()
+                        .unwrap_or("never")
+                );
+            }
+            Err(aws_sdk_s3::types::SdkError::ServiceError(err)) if err.err().is_no_such_key() => {
+                println!("\tno main database snapshot file found")
+            }
+            Err(e) => println!("\tfailed to fetch main database snapshot info: {}", e),
+        };
+        Ok(())
+    }
+
     pub async fn list_generations(
         &self,
         limit: Option<u64>,
@@ -84,6 +116,8 @@ impl Replicator {
                         println!("\tcreated at (UTC):     {}", datetime);
                         println!("\tchange counter:       {:?}", counter);
                         println!("\tconsistent WAL frame: {}", consistent_frame);
+                        self.print_snapshot_summary(&uuid).await?;
+                        println!()
                     }
                 }
                 limit -= 1;
@@ -152,6 +186,7 @@ impl Replicator {
         println!("\tcreated at:           {}", uuid_to_datetime(&generation));
         println!("\tchange counter:       {:?}", counter);
         println!("\tconsistent WAL frame: {}", consistent_frame);
+        self.print_snapshot_summary(&generation).await?;
         Ok(())
     }
 }
@@ -172,21 +207,44 @@ struct Cli {
 enum Commands {
     #[clap(about = "List available generations")]
     Ls {
-        #[clap(long, short)]
+        #[clap(long, short, long_help = "List details about single generation")]
         generation: Option<uuid::Uuid>,
-        #[clap(long, short)]
+        #[clap(
+            long,
+            short,
+            conflicts_with = "generation",
+            long_help = "List only <limit> newest generations"
+        )]
         limit: Option<u64>,
-        #[clap(long)]
+        #[clap(
+            long,
+            conflicts_with = "generation",
+            long_help = "List only generations older than given date"
+        )]
         older_than: Option<chrono::NaiveDate>,
-        #[clap(long)]
+        #[clap(
+            long,
+            conflicts_with = "generation",
+            long_help = "List only generations newer than given date"
+        )]
         newer_than: Option<chrono::NaiveDate>,
-        #[clap(long, short)]
+        #[clap(
+            long,
+            short,
+            long_help = "Print detailed information on each generation"
+        )]
         verbose: bool,
     },
+    #[clap(about = "Restore the database")]
     Restore {
-        #[clap(long, short)]
+        #[clap(
+            long,
+            short,
+            long_help = "Generation to restore from.\nSkip this parameter to restore from the newest generation."
+        )]
         generation: Option<uuid::Uuid>,
     },
+    #[clap(about = "Remove given generation from remote storage")]
     Rm {
         #[clap(long, short)]
         generation: uuid::Uuid,
