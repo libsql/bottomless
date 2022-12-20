@@ -6,7 +6,7 @@ SQLITE_EXTENSION_INIT1
 extern void bottomless_init();
 extern struct libsql_wal_methods* bottomless_methods(struct libsql_wal_methods*);
 
-int sqlite3_extension_init(
+int sqlite3_bottomless_init(
   sqlite3 *db, 
   char **pzErrMsg, 
   const sqlite3_api_routines *pApi
