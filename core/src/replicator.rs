@@ -107,7 +107,6 @@ impl Replicator {
     }
 
     pub fn register_db(&mut self, db_path: impl Into<String>) {
-        assert!(self.db_name.is_empty());
         let db_path = db_path.into();
         let name = match db_path.rfind('/') {
             Some(index) => db_path[index + 1..].to_string(),
