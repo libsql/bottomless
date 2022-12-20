@@ -1,4 +1,6 @@
-#include "./libsql/sqlite3ext.h"
+#ifdef LIBSQL_ENABLE_BOTTOMLESS_WAL
+
+#include "sqlite3ext.h"
 SQLITE_EXTENSION_INIT1
 
 #include <stdio.h>
@@ -11,6 +13,14 @@ int sqlite3_bottomless_init(
   char **pzErrMsg, 
   const sqlite3_api_routines *pApi
 ) {
+  // yes, racy
+  static int initialized = 0;
+  if (initialized == 0) {
+    initialized = 1;
+  } else {
+    return 0;
+  }
+
   SQLITE_EXTENSION_INIT2(pApi);
 
   bottomless_init();
@@ -22,3 +32,9 @@ int sqlite3_bottomless_init(
 
   return libsql_wal_methods_register(methods);
 }
+
+int libsqlBottomlessInit(sqlite3 *db) {
+  return sqlite3_bottomless_init(db, NULL, NULL);
+}
+
+#endif
