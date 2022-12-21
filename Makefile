@@ -8,10 +8,9 @@ debug_standalone:	bottomless.c core/src/lib.rs
 release:	prep release_standalone
 
 release_standalone:	bottomless.c core/src/lib.rs
-	cargo +nightly build -Z build-std=std,panic_abort -Z build-std-features=panic_immediate_abort -j1 \
-		--quiet --release --target x86_64-unknown-linux-gnu && \
-		clang -fPIC -shared -I libsql/ -DLIBSQL_ENABLE_BOTTOMLESS_WAL bottomless.c target/x86_64-unknown-linux-gnu/release/libbottomless.a \
-		-o target/x86_64-unknown-linux-gnu/release/bottomless.so
+	cargo build -j1	--quiet --release && \
+		clang -fPIC -shared -I libsql/ -DLIBSQL_ENABLE_BOTTOMLESS_WAL bottomless.c target/release/libbottomless.a \
+		-o target/release/bottomless.so
 
 prep:
 	( cd libsql && make || ( ./configure && make ) )
