@@ -30,7 +30,11 @@ int sqlite3_bottomless_init(
   }
   struct libsql_wal_methods *methods = bottomless_methods(orig);
 
-  return libsql_wal_methods_register(methods);
+  if (methods) {
+    return libsql_wal_methods_register(methods);
+  }
+  // It's not fatal to fail to instantiate methods - it will be logged.
+  return SQLITE_OK;
 }
 
 int libsqlBottomlessInit(sqlite3 *db) {
