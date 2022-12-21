@@ -124,6 +124,7 @@ pub struct Wal {
     p_snapshot: *const c_void,
     p_db: *const c_void,
     pub wal_methods: *mut libsql_wal_methods,
+    pub replicator_context: *mut ReplicatorContext,
 }
 
 // Only here for creating a Wal struct instance, we're not going to use it
@@ -152,7 +153,7 @@ pub struct libsql_wal_methods {
         no_shm_mode: i32,
         max_size: i64,
         methods: *mut libsql_wal_methods,
-        wal: *mut *const Wal,
+        wal: *mut *mut Wal,
     ) -> i32,
     pub xClose: extern "C" fn(
         wal: *mut Wal,
@@ -218,6 +219,9 @@ pub struct libsql_wal_methods {
 
     // User data
     pub underlying_methods: *const libsql_wal_methods,
+}
+
+pub struct ReplicatorContext {
     pub replicator: crate::replicator::Replicator,
     pub runtime: tokio::runtime::Runtime,
 }

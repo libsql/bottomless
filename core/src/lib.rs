@@ -14,7 +14,7 @@ pub extern "C" fn xOpen(
     no_shm_mode: i32,
     max_size: i64,
     methods: *mut libsql_wal_methods,
-    wal: *mut *const Wal,
+    wal: *mut *mut Wal,
 ) -> i32 {
     tracing::debug!("Opening WAL {}", unsafe {
         std::ffi::CStr::from_ptr(wal_name).to_str().unwrap()
@@ -23,15 +23,47 @@ pub extern "C" fn xOpen(
     // or remove this comment once the implementation becomes
     // independent of VFS used.
     let orig_methods = unsafe { &*(*methods).underlying_methods };
-    (orig_methods.xOpen)(vfs, db_file, wal_name, no_shm_mode, max_size, methods, wal)
+    let rc = (orig_methods.xOpen)(vfs, db_file, wal_name, no_shm_mode, max_size, methods, wal);
+    if rc != ffi::SQLITE_OK {
+        return rc;
+    }
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            tracing::error!("Failed to initialize async runtime: {}", e);
+            return ffi::SQLITE_CANTOPEN;
+        }
+    };
+
+    let replicator = runtime.block_on(async { replicator::Replicator::new().await });
+    let replicator = match replicator {
+        Ok(repl) => repl,
+        Err(e) => {
+            tracing::error!("Failed to initialize replicator: {}", e);
+            return ffi::SQLITE_CANTOPEN;
+        }
+    };
+
+    let context = ffi::ReplicatorContext {
+        replicator,
+        runtime,
+    };
+
+    // fixme: leak
+    unsafe { (*(*wal)).replicator_context = Box::leak(Box::new(context)) };
+
+    ffi::SQLITE_OK
 }
 
 fn get_orig_methods(wal: *mut Wal) -> &'static libsql_wal_methods {
     unsafe { &*((*(*wal).wal_methods).underlying_methods) }
 }
 
-fn get_methods(wal: *mut Wal) -> &'static mut libsql_wal_methods {
-    unsafe { &mut *((*wal).wal_methods) }
+fn get_replicator_context(wal: *mut Wal) -> &'static mut ffi::ReplicatorContext {
+    unsafe { &mut *((*wal).replicator_context) }
 }
 
 pub extern "C" fn xClose(
@@ -43,6 +75,8 @@ pub extern "C" fn xClose(
 ) -> i32 {
     tracing::debug!("Closing wal");
     let orig_methods = get_orig_methods(wal);
+    let _replicator_box = unsafe { Box::from_raw((*wal).replicator_context) };
+
     (orig_methods.xClose)(wal, db, sync_flags, n_buf, z_buf)
 }
 
@@ -113,21 +147,21 @@ pub extern "C" fn xFrames(
     is_commit: i32,
     sync_flags: i32,
 ) -> i32 {
-    let methods = get_methods(wal);
+    let ctx = get_replicator_context(wal);
     let orig_methods = get_orig_methods(wal);
     // In theory it's enough to set the page size only once, but in practice
     // it's a very cheap operation anyway, and the page is not always known
     // upfront and can change dynamically.
     // FIXME: changing the page size in the middle of operation is *not*
     // supported by bottomless storage.
-    methods.replicator.set_page_size(page_size as usize);
+    ctx.replicator.set_page_size(page_size as usize);
     for (pgno, data) in ffi::PageHdrIter::new(page_headers, page_size as usize) {
-        methods.replicator.write(pgno, data);
+        ctx.replicator.write(pgno, data);
     }
     if is_commit != 0 {
-        let result = methods
+        let result = ctx
             .runtime
-            .block_on(async { methods.replicator.commit().await });
+            .block_on(async { ctx.replicator.commit().await });
         match result {
             Ok(()) => (),
             Err(e) => {
@@ -193,7 +227,7 @@ pub extern "C" fn xCheckpoint(
     };
 
     let orig_methods = get_orig_methods(wal);
-    let methods = get_methods(wal);
+    let ctx = get_replicator_context(wal);
     let rc = (orig_methods.xCheckpoint)(
         wal,
         db,
@@ -210,16 +244,16 @@ pub extern "C" fn xCheckpoint(
         return rc;
     }
 
-    if methods.replicator.commits_in_current_generation == 0 {
+    if ctx.replicator.commits_in_current_generation == 0 {
         tracing::debug!("No commits happened in this generation, not snapshotting");
         return ffi::SQLITE_OK;
     }
 
-    methods.replicator.new_generation();
+    ctx.replicator.new_generation();
     tracing::debug!("Snapshotting after checkpoint");
-    let result = methods
+    let result = ctx
         .runtime
-        .block_on(async { methods.replicator.snapshot_main_db_file().await });
+        .block_on(async { ctx.replicator.snapshot_main_db_file().await });
     match result {
         Ok(()) => (),
         Err(e) => {
@@ -268,7 +302,7 @@ pub extern "C" fn xGetPathname(buf: *mut u8, orig: *const u8, orig_len: i32) {
     unsafe { std::ptr::copy("-wal".as_ptr(), buf.offset(orig_len as isize), 4) }
 }
 
-pub extern "C" fn xPreMainDbOpen(methods: *mut libsql_wal_methods, path: *const i8) -> i32 {
+pub extern "C" fn xPreMainDbOpen(_methods: *mut libsql_wal_methods, path: *const i8) -> i32 {
     if path.is_null() {
         return ffi::SQLITE_OK;
     }
@@ -282,12 +316,29 @@ pub extern "C" fn xPreMainDbOpen(methods: *mut libsql_wal_methods, path: *const 
         }
     };
     tracing::debug!("Main database file {} will be open soon", path);
-    let methods = unsafe { &mut *methods };
-    let replicator = &mut methods.replicator;
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            tracing::error!("Failed to initialize async runtime: {}", e);
+            return ffi::SQLITE_CANTOPEN;
+        }
+    };
+
+    let replicator = runtime.block_on(async { replicator::Replicator::new().await });
+    let mut replicator = match replicator {
+        Ok(repl) => repl,
+        Err(e) => {
+            tracing::error!("Failed to initialize replicator: {}", e);
+            return ffi::SQLITE_CANTOPEN;
+        }
+    };
 
     replicator.register_db(path);
-
-    methods.runtime.block_on(async {
+    runtime.block_on(async {
         match replicator.restore().await {
             Ok(replicator::RestoreAction::None) => (),
             Ok(replicator::RestoreAction::SnapshotMainDbFile) => {
@@ -335,26 +386,6 @@ pub extern "C" fn bottomless_methods(
 ) -> *const libsql_wal_methods {
     let vwal_name: *const u8 = "bottomless\0".as_ptr();
 
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(e) => {
-            tracing::error!("Failed to initialize async runtime: {}", e);
-            return std::ptr::null();
-        }
-    };
-
-    let replicator = runtime.block_on(async { replicator::Replicator::new().await });
-    let replicator = match replicator {
-        Ok(repl) => repl,
-        Err(e) => {
-            tracing::error!("Failed to initialize replicator: {}", e);
-            return std::ptr::null();
-        }
-    };
-
     Box::into_raw(Box::new(libsql_wal_methods {
         iVersion: 1,
         xOpen,
@@ -391,7 +422,5 @@ pub extern "C" fn bottomless_methods(
         b_uses_shm: 0,
         p_next: std::ptr::null(),
         underlying_methods,
-        replicator,
-        runtime,
     }))
 }
