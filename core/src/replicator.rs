@@ -133,8 +133,19 @@ impl Replicator {
         self.next_frame - 1
     }
 
-    pub fn peek_max_frame(&self) -> u32 {
+    pub fn peek_last_valid_frame(&self) -> u32 {
         self.next_frame.saturating_sub(1)
+    }
+
+    pub fn register_last_valid_frame(&mut self, frame: u32) {
+        if frame != self.peek_last_valid_frame() {
+            tracing::error!(
+                "[BUG] Local max valid frame is {}, while replicator thinks it's {}",
+                frame,
+                self.peek_last_valid_frame()
+            );
+            self.next_frame = frame + 1
+        }
     }
 
     pub fn write(&mut self, pgno: i32, data: &[u8]) {

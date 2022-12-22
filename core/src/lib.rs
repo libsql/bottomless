@@ -153,9 +153,9 @@ pub extern "C" fn xUndo(
 
     let last_valid_frame = unsafe { (*wal).hdr.last_valid_frame };
     let ctx = get_replicator_context(wal);
-    tracing::warn!(
+    tracing::trace!(
         "Undo: rolling back from frame {} to {}",
-        ctx.replicator.peek_max_frame(),
+        ctx.replicator.peek_last_valid_frame(),
         last_valid_frame
     );
     ctx.replicator.rollback_to_frame(last_valid_frame);
@@ -177,9 +177,9 @@ pub extern "C" fn xSavepointUndo(wal: *mut Wal, wal_data: *mut u32) -> i32 {
 
     let last_valid_frame = unsafe { *wal_data };
     let ctx = get_replicator_context(wal);
-    tracing::warn!(
+    tracing::trace!(
         "Savepoint: rolling back from frame {} to {}",
-        ctx.replicator.peek_max_frame(),
+        ctx.replicator.peek_last_valid_frame(),
         last_valid_frame
     );
     ctx.replicator.rollback_to_frame(last_valid_frame);
@@ -196,6 +196,8 @@ pub extern "C" fn xFrames(
     sync_flags: i32,
 ) -> i32 {
     let ctx = get_replicator_context(wal);
+    let last_valid_frame = unsafe { (*wal).hdr.last_valid_frame };
+    ctx.replicator.register_last_valid_frame(last_valid_frame);
     let orig_methods = get_orig_methods(wal);
     // In theory it's enough to set the page size only once, but in practice
     // it's a very cheap operation anyway, and the page is not always known

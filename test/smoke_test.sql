@@ -14,10 +14,21 @@ BEGIN;
 INSERT INTO test VALUES ('presavepoint');
 SAVEPOINT test1;
 INSERT INTO test VALUES (43);
-INSERT INTO test VALUES (zeroblob(12553));
+INSERT INTO test VALUES (zeroblob(2000000));
+INSERT INTO test VALUES (zeroblob(2000000));
+INSERT INTO test VALUES (zeroblob(2000000));
 INSERT INTO test VALUES ('heyyyy');
 ROLLBACK TO SAVEPOINT test1;
 COMMIT;
+
+BEGIN;
+INSERT INTO test VALUES (3.16);
+INSERT INTO test VALUES (zeroblob(1000000));
+INSERT INTO test VALUES (zeroblob(1000000));
+INSERT INTO test VALUES (zeroblob(1000000));
+ROLLBACK;
+
+INSERT INTO test VALUES (3.14);
 
 SELECT v, length(v) FROM test;
 .exit
