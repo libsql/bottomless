@@ -132,11 +132,11 @@ impl Replicator {
 
     // Sends the pages participating in a commit to S3
     pub async fn commit(&mut self) -> Result<()> {
-        tracing::debug!("Write buffer size: {}", self.write_buffer.len());
+        tracing::trace!("Committing {} frames", self.write_buffer.len());
         self.commits_in_current_generation += 1;
         let mut tasks = vec![];
         // FIXME: instead of batches processed in bursts, better to allow X concurrent tasks with a semaphore
-        const CONCURRENCY: usize = 16;
+        const CONCURRENCY: usize = 64;
         for (frame, (pgno, bytes)) in self.write_buffer.iter() {
             let data: &[u8] = bytes;
             if data.len() != self.page_size {
@@ -149,7 +149,7 @@ impl Replicator {
                 "{}-{}/{:012}-{:012}",
                 self.db_name, self.generation, frame, pgno
             );
-            tracing::debug!("Committing {} (compressed size: {})", key, compressed.len());
+            tracing::trace!("Committing {} (compressed size: {})", key, compressed.len());
             tasks.push(
                 self.client
                     .put_object()
@@ -181,7 +181,13 @@ impl Replicator {
             )))
             .send()
             .await?;
+        tracing::trace!("Commit successful");
         Ok(())
+    }
+
+    pub fn rollback_to_frame(&mut self, last_valid_frame: u32) {
+        // NOTICE: linear, we can migrate write_buffer to BTreeMap if ever needed
+        self.write_buffer.retain(|&k, _| k <= last_valid_frame);
     }
 
     async fn read_change_counter(reader: &mut tokio::fs::File) -> Result<[u8; 4]> {
@@ -255,12 +261,23 @@ impl Replicator {
         Ok(())
     }
 
+    async fn main_db_exists_and_not_empty(&self) -> bool {
+        let file = match tokio::fs::File::open(&self.db_path).await {
+            Ok(file) => file,
+            Err(_) => return false,
+        };
+        match file.metadata().await {
+            Ok(metadata) => metadata.len() > 0,
+            Err(_) => false,
+        }
+    }
+
     // Sends the main database file to S3 - if -wal file is present, it's replicated
     // too - it means that the local file was detected to be newer than its remote
     // counterpart.
     pub async fn snapshot_main_db_file(&mut self) -> Result<()> {
-        if !std::path::Path::new(&self.db_path).exists() {
-            tracing::debug!("Not snapshotting, the main db file does not exist");
+        if !self.main_db_exists_and_not_empty().await {
+            tracing::debug!("Not snapshotting, the main db file does not exist or is empty");
             return Ok(());
         }
         tracing::debug!("Snapshotting {}", self.db_path);
@@ -408,20 +425,23 @@ impl Replicator {
             Ordering::Less => (),
         }
 
-        let db_file = self
-            .get_object(format!("{}-{}/db.gz", self.db_name, generation))
-            .send()
-            .await?;
-        let body_reader = db_file.body.into_async_read();
-        let mut decompress_reader = async_compression::tokio::bufread::GzipDecoder::new(
-            tokio::io::BufReader::new(body_reader),
-        );
         tokio::fs::rename(&self.db_path, format!("{}.bottomless.backup", self.db_path))
             .await
             .ok(); // Best effort
         let mut main_db_writer = tokio::fs::File::create(&self.db_path).await?;
-        tokio::io::copy(&mut decompress_reader, &mut main_db_writer).await?;
-        main_db_writer.flush().await?;
+        // If the db file is not present, the database could have been empty
+        if let Ok(db_file) = self
+            .get_object(format!("{}-{}/db.gz", self.db_name, generation))
+            .send()
+            .await
+        {
+            let body_reader = db_file.body.into_async_read();
+            let mut decompress_reader = async_compression::tokio::bufread::GzipDecoder::new(
+                tokio::io::BufReader::new(body_reader),
+            );
+            tokio::io::copy(&mut decompress_reader, &mut main_db_writer).await?;
+            main_db_writer.flush().await?;
+        }
         tracing::info!("Restored the main database file");
 
         let mut next_marker = None;

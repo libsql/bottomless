@@ -39,7 +39,7 @@ pub extern "C" fn xOpen(
     };
 
     let replicator = runtime.block_on(async { replicator::Replicator::new().await });
-    let replicator = match replicator {
+    let mut replicator = match replicator {
         Ok(repl) => repl,
         Err(e) => {
             tracing::error!("Failed to initialize replicator: {}", e);
@@ -47,12 +47,22 @@ pub extern "C" fn xOpen(
         }
     };
 
+    let path = unsafe {
+        match std::ffi::CStr::from_ptr(wal_name).to_str() {
+            Ok(path) if path.len() >= 4 => &path[..path.len() - 4],
+            Ok(path) => path,
+            Err(e) => {
+                tracing::error!("Failed to parse the main database path: {}", e);
+                return ffi::SQLITE_CANTOPEN;
+            }
+        }
+    };
+
+    replicator.register_db(path);
     let context = ffi::ReplicatorContext {
         replicator,
         runtime,
     };
-
-    // fixme: leak
     unsafe { (*(*wal)).replicator_context = Box::leak(Box::new(context)) };
 
     ffi::SQLITE_OK
@@ -135,6 +145,10 @@ pub extern "C" fn xSavepoint(wal: *mut Wal, wal_data: *mut u32) {
 }
 
 pub extern "C" fn xSavepointUndo(wal: *mut Wal, wal_data: *mut u32) -> i32 {
+    let last_valid_frame = unsafe { *wal_data };
+    tracing::trace!("Savepoint: rolling back to frame {}", last_valid_frame);
+    let ctx = get_replicator_context(wal);
+    ctx.replicator.rollback_to_frame(last_valid_frame);
     let orig_methods = get_orig_methods(wal);
     (orig_methods.xSavepointUndo)(wal, wal_data)
 }
