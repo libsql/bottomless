@@ -146,7 +146,21 @@ pub extern "C" fn xUndo(
     ctx: *mut c_void,
 ) -> i32 {
     let orig_methods = get_orig_methods(wal);
-    (orig_methods.xUndo)(wal, func, ctx)
+    let rc = (orig_methods.xUndo)(wal, func, ctx);
+    if rc != ffi::SQLITE_OK {
+        return rc;
+    }
+
+    let last_valid_frame = unsafe { (*wal).hdr.last_valid_frame };
+    let ctx = get_replicator_context(wal);
+    tracing::warn!(
+        "Undo: rolling back from frame {} to {}",
+        ctx.replicator.peek_max_frame(),
+        last_valid_frame
+    );
+    ctx.replicator.rollback_to_frame(last_valid_frame);
+
+    ffi::SQLITE_OK
 }
 
 pub extern "C" fn xSavepoint(wal: *mut Wal, wal_data: *mut u32) {
@@ -155,12 +169,22 @@ pub extern "C" fn xSavepoint(wal: *mut Wal, wal_data: *mut u32) {
 }
 
 pub extern "C" fn xSavepointUndo(wal: *mut Wal, wal_data: *mut u32) -> i32 {
-    let last_valid_frame = unsafe { *wal_data };
-    tracing::trace!("Savepoint: rolling back to frame {}", last_valid_frame);
-    let ctx = get_replicator_context(wal);
-    ctx.replicator.rollback_to_frame(last_valid_frame);
     let orig_methods = get_orig_methods(wal);
-    (orig_methods.xSavepointUndo)(wal, wal_data)
+    let rc = (orig_methods.xSavepointUndo)(wal, wal_data);
+    if rc != ffi::SQLITE_OK {
+        return rc;
+    }
+
+    let last_valid_frame = unsafe { *wal_data };
+    let ctx = get_replicator_context(wal);
+    tracing::warn!(
+        "Savepoint: rolling back from frame {} to {}",
+        ctx.replicator.peek_max_frame(),
+        last_valid_frame
+    );
+    ctx.replicator.rollback_to_frame(last_valid_frame);
+
+    ffi::SQLITE_OK
 }
 
 pub extern "C" fn xFrames(
@@ -185,6 +209,7 @@ pub extern "C" fn xFrames(
     for (pgno, data) in ffi::PageHdrIter::new(page_headers, page_size as usize) {
         ctx.replicator.write(pgno, data);
     }
+
     if is_commit != 0 {
         let result = ctx
             .runtime
@@ -210,7 +235,7 @@ extern "C" fn always_wait(_busy_param: *mut c_void) -> i32 {
     1
 }
 
-#[tracing::instrument(skip(wal, db))]
+#[tracing::instrument(skip(wal, db, busy_handler, busy_arg))]
 pub extern "C" fn xCheckpoint(
     wal: *mut Wal,
     db: *mut c_void,

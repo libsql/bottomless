@@ -106,13 +106,14 @@ impl Replicator {
     }
 
     pub fn new_generation(&mut self) {
-        self.generation = Self::generate_generation();
-        self.commits_in_current_generation = 0;
         tracing::debug!("New generation started: {}", self.generation);
+        self.set_generation(Self::generate_generation());
     }
 
     pub fn set_generation(&mut self, generation: uuid::Uuid) {
         self.generation = generation;
+        self.commits_in_current_generation = 0;
+        self.next_frame = 1; // New generation marks a new WAL
         tracing::debug!("Generation set to {}", self.generation);
     }
 
@@ -127,9 +128,13 @@ impl Replicator {
         tracing::debug!("Registered {} (full path: {})", self.db_name, self.db_path);
     }
 
-    pub fn next_frame(&mut self) -> u32 {
+    fn next_frame(&mut self) -> u32 {
         self.next_frame += 1;
         self.next_frame - 1
+    }
+
+    pub fn peek_max_frame(&self) -> u32 {
+        self.next_frame.saturating_sub(1)
     }
 
     pub fn write(&mut self, pgno: i32, data: &[u8]) {
@@ -198,6 +203,7 @@ impl Replicator {
     pub fn rollback_to_frame(&mut self, last_valid_frame: u32) {
         // NOTICE: linear, we can migrate write_buffer to BTreeMap if ever needed
         self.write_buffer.retain(|&k, _| k <= last_valid_frame);
+        self.next_frame = last_valid_frame + 1;
     }
 
     async fn read_change_counter(reader: &mut tokio::fs::File) -> Result<[u8; 4]> {
