@@ -19,7 +19,7 @@ pub struct sqlite3_vfs {
     szOsFile: i32,
     mxPathname: i32,
     pNext: *mut sqlite3_vfs,
-    zname: *const i8,
+    pub(crate) zName: *const i8,
     pData: *const c_void,
     xOpen: unsafe extern "C" fn(
         vfs: *mut sqlite3_vfs,

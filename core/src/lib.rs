@@ -7,6 +7,15 @@ pub mod replicator;
 use crate::ffi::{libsql_wal_methods, sqlite3_file, sqlite3_vfs, PgHdr, Wal};
 use std::ffi::c_void;
 
+// Just heuristics, but should work for ~100% of cases
+fn is_regular(vfs: *const sqlite3_vfs) -> bool {
+    let vfs = unsafe { std::ffi::CStr::from_ptr((*vfs).zName) }
+        .to_str()
+        .unwrap_or("[error]");
+    tracing::trace!("VFS: {}", vfs);
+    vfs.starts_with("unix") || vfs.starts_with("win32")
+}
+
 pub extern "C" fn xOpen(
     vfs: *const sqlite3_vfs,
     db_file: *mut sqlite3_file,
@@ -19,9 +28,10 @@ pub extern "C" fn xOpen(
     tracing::debug!("Opening WAL {}", unsafe {
         std::ffi::CStr::from_ptr(wal_name).to_str().unwrap()
     });
-    // FIXME: return error if non-standard VFS is used,
-    // or remove this comment once the implementation becomes
-    // independent of VFS used.
+    if !is_regular(vfs) {
+        tracing::error!("Bottomless WAL is currently only supported for regular VFS");
+        return ffi::SQLITE_CANTOPEN;
+    }
     let orig_methods = unsafe { &*(*methods).underlying_methods };
     let rc = (orig_methods.xOpen)(vfs, db_file, wal_name, no_shm_mode, max_size, methods, wal);
     if rc != ffi::SQLITE_OK {
@@ -168,7 +178,10 @@ pub extern "C" fn xFrames(
     // upfront and can change dynamically.
     // FIXME: changing the page size in the middle of operation is *not*
     // supported by bottomless storage.
-    ctx.replicator.set_page_size(page_size as usize);
+    if let Err(e) = ctx.replicator.set_page_size(page_size as usize) {
+        tracing::error!("{}", e);
+        return ffi::SQLITE_IOERR_WRITE;
+    }
     for (pgno, data) in ffi::PageHdrIter::new(page_headers, page_size as usize) {
         ctx.replicator.write(pgno, data);
     }
@@ -176,12 +189,9 @@ pub extern "C" fn xFrames(
         let result = ctx
             .runtime
             .block_on(async { ctx.replicator.commit().await });
-        match result {
-            Ok(()) => (),
-            Err(e) => {
-                tracing::error!("Failed to replicate: {}", e);
-                return ffi::SQLITE_IOERR_WRITE;
-            }
+        if let Err(e) = result {
+            tracing::error!("Failed to replicate: {}", e);
+            return ffi::SQLITE_IOERR_WRITE;
         }
     }
 
@@ -268,15 +278,12 @@ pub extern "C" fn xCheckpoint(
     let result = ctx
         .runtime
         .block_on(async { ctx.replicator.snapshot_main_db_file().await });
-    match result {
-        Ok(()) => (),
-        Err(e) => {
-            tracing::error!(
-                "Failed to snapshot the main db file during checkpoint: {}",
-                e
-            );
-            return ffi::SQLITE_IOERR_WRITE;
-        }
+    if let Err(e) = result {
+        tracing::error!(
+            "Failed to snapshot the main db file during checkpoint: {}",
+            e
+        );
+        return ffi::SQLITE_IOERR_WRITE;
     }
 
     ffi::SQLITE_OK
@@ -357,21 +364,15 @@ pub extern "C" fn xPreMainDbOpen(_methods: *mut libsql_wal_methods, path: *const
             Ok(replicator::RestoreAction::None) => (),
             Ok(replicator::RestoreAction::SnapshotMainDbFile) => {
                 replicator.new_generation();
-                match replicator.snapshot_main_db_file().await {
-                    Ok(()) => (),
-                    Err(e) => {
-                        tracing::error!("Failed to snapshot the main db file: {}", e);
-                        return ffi::SQLITE_CANTOPEN;
-                    }
+                if let Err(e) = replicator.snapshot_main_db_file().await {
+                    tracing::error!("Failed to snapshot the main db file: {}", e);
+                    return ffi::SQLITE_CANTOPEN;
                 }
                 // Restoration process only leaves the local WAL file if it was
                 // detected to be newer than its remote counterpart.
-                match replicator.maybe_replicate_wal().await {
-                    Ok(()) => (),
-                    Err(e) => {
-                        tracing::error!("Failed to replicate local WAL: {}", e);
-                        return ffi::SQLITE_CANTOPEN;
-                    }
+                if let Err(e) = replicator.maybe_replicate_wal().await {
+                    tracing::error!("Failed to replicate local WAL: {}", e);
+                    return ffi::SQLITE_CANTOPEN;
                 }
             }
             Ok(replicator::RestoreAction::ReuseGeneration(gen)) => {

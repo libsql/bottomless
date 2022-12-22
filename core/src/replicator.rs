@@ -34,7 +34,7 @@ pub enum RestoreAction {
 }
 
 impl Replicator {
-    pub const DEFAULT_PAGE_SIZE: usize = 4096;
+    pub const UNSET_PAGE_SIZE: usize = usize::MAX;
 
     pub async fn new() -> Result<Self> {
         let write_buffer = HashMap::new();
@@ -61,7 +61,7 @@ impl Replicator {
             client,
             write_buffer,
             bucket,
-            page_size: Self::DEFAULT_PAGE_SIZE,
+            page_size: Self::UNSET_PAGE_SIZE,
             generation,
             commits_in_current_generation: 0,
             next_frame: 1,
@@ -72,10 +72,20 @@ impl Replicator {
 
     // The database can use different page size - as soon as it's known,
     // it should be communicated to the replicator via this call.
-    // FIXME: we don't support dynamically changing page size, and SQLite,
-    // in general, does. It needs to be checked here.
-    pub fn set_page_size(&mut self, page_size: usize) {
-        self.page_size = page_size
+    // NOTICE: in practice, WAL journaling mode does not allow changing page sizes,
+    // so verifying that it hasn't changed is a panic check. Perhaps in the future
+    // it will be useful, if WAL ever allows changing the page size.
+    pub fn set_page_size(&mut self, page_size: usize) -> Result<()> {
+        tracing::trace!("Setting page size from {} to {}", self.page_size, page_size);
+        if self.page_size != Self::UNSET_PAGE_SIZE && self.page_size != page_size {
+            return Err(anyhow::anyhow!(
+                "Cannot set page size to {}, it was already set to {}",
+                page_size,
+                self.page_size
+            ));
+        }
+        self.page_size = page_size;
+        Ok(())
     }
 
     fn get_object(&self, key: String) -> aws_sdk_s3::client::fluent_builders::GetObject {
@@ -198,6 +208,17 @@ impl Replicator {
         Ok(counter)
     }
 
+    async fn read_page_size(reader: &mut tokio::fs::File) -> Result<usize> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        reader.seek(std::io::SeekFrom::Start(16)).await?;
+        let page_size = reader.read_u16().await?;
+        if page_size == 1 {
+            Ok(65536)
+        } else {
+            Ok(page_size as usize)
+        }
+    }
+
     // Returns the compressed database file path and its change counter, extracted
     // from the header of page1 at offset 24..27 (as per SQLite documentation).
     pub async fn compress_main_db_file(&self) -> Result<(&'static str, [u8; 4])> {
@@ -239,7 +260,7 @@ impl Replicator {
             wal_file.seek(tokio::io::SeekFrom::Start(offset)).await?;
             let pgno = wal_file.read_i32().await?;
             let size_after = wal_file.read_i32().await?;
-            tracing::warn!("Size after transaction for {}: {}", pgno, size_after);
+            tracing::trace!("Size after transaction for {}: {}", pgno, size_after);
             wal_file
                 .seek(tokio::io::SeekFrom::Start(offset + 24))
                 .await?;
@@ -357,15 +378,32 @@ impl Replicator {
         )
     }
 
-    async fn get_wal_page_count(&self) -> u32 {
+    async fn get_wal_page_count(&mut self) -> u32 {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
         match tokio::fs::File::open(&format!("{}-wal", &self.db_path)).await {
-            Ok(file) => {
+            Ok(mut file) => {
                 let metadata = match file.metadata().await {
                     Ok(metadata) => metadata,
                     Err(_) => return 0,
                 };
-                // Each WAL file consists of a 32-byte WAL header and N entries of size (page size + 24)
-                (metadata.len() / (self.page_size + 24) as u64) as u32
+                let len = metadata.len();
+                if len >= 32 {
+                    // Page size is stored in WAL file at offset [8-12)
+                    if file.seek(tokio::io::SeekFrom::Start(8)).await.is_err() {
+                        return 0;
+                    };
+                    let page_size = match file.read_u32().await {
+                        Ok(size) => size,
+                        Err(_) => return 0,
+                    };
+                    if self.set_page_size(page_size as usize).is_err() {
+                        return 0;
+                    }
+                    // Each WAL file consists of a 32-byte WAL header and N entries of size (page size + 24)
+                    (len / (self.page_size + 24) as u64) as u32
+                } else {
+                    0
+                }
             }
             Err(_) => 0,
         }
@@ -380,13 +418,20 @@ impl Replicator {
         Some((frameno, pgno))
     }
 
-    pub async fn restore_from(&self, generation: uuid::Uuid) -> Result<RestoreAction> {
+    pub async fn restore_from(&mut self, generation: uuid::Uuid) -> Result<RestoreAction> {
         use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
         // Check if the database needs to be restored by inspecting the database
         // change counter and the WAL size.
         let local_counter = match tokio::fs::File::open(&self.db_path).await {
-            Ok(mut db) => Self::read_change_counter(&mut db).await.unwrap_or([0u8; 4]),
+            Ok(mut db) => {
+                // While reading the main database file for the first time,
+                // page size from an existing database should be set.
+                if let Ok(page_size) = Self::read_page_size(&mut db).await {
+                    self.set_page_size(page_size)?;
+                }
+                Self::read_change_counter(&mut db).await.unwrap_or([0u8; 4])
+            }
             Err(_) => [0u8; 4],
         };
 
@@ -491,15 +536,27 @@ impl Replicator {
                 let mut decompress_reader = async_compression::tokio::bufread::GzipDecoder::new(
                     tokio::io::BufReader::new(body_reader),
                 );
-                let offset = (pgno - 1) as u64 * self.page_size as u64;
-                main_db_writer
-                    .seek(tokio::io::SeekFrom::Start(offset))
-                    .await?;
-                // FIXME: we only need to overwrite with the newest page,
-                // no need to replay the whole WAL
-                tokio::io::copy(&mut decompress_reader, &mut main_db_writer).await?;
+                if self.page_size == Self::UNSET_PAGE_SIZE {
+                    let mut page_buffer = Vec::with_capacity(4096); // best guess for the page size
+                    let page_size =
+                        tokio::io::copy(&mut decompress_reader, &mut page_buffer).await?;
+                    self.set_page_size(page_size as usize)?;
+                    let offset = (pgno - 1) as u64 * page_size;
+                    main_db_writer
+                        .seek(tokio::io::SeekFrom::Start(offset))
+                        .await?;
+                    tokio::io::copy(&mut &page_buffer[..], &mut main_db_writer).await?;
+                } else {
+                    let offset = (pgno - 1) as u64 * self.page_size as u64;
+                    main_db_writer
+                        .seek(tokio::io::SeekFrom::Start(offset))
+                        .await?;
+                    // FIXME: we only need to overwrite with the newest page,
+                    // no need to replay the whole WAL
+                    tokio::io::copy(&mut decompress_reader, &mut main_db_writer).await?;
+                }
                 main_db_writer.flush().await?;
-                tracing::debug!("Written frame {} as main db page {}", frameno, pgno,);
+                tracing::debug!("Written frame {} as main db page {}", frameno, pgno);
                 applied_wal_frame = true;
             }
             next_marker = response
@@ -518,7 +575,7 @@ impl Replicator {
         }
     }
 
-    pub async fn restore(&self) -> Result<RestoreAction> {
+    pub async fn restore(&mut self) -> Result<RestoreAction> {
         let newest_generation = match self.find_newest_generation().await {
             Some(gen) => gen,
             None => {
