@@ -376,7 +376,12 @@ pub extern "C" fn xPreMainDbOpen(_methods: *mut libsql_wal_methods, path: *const
         }
     };
 
-    let replicator = runtime.block_on(async { replicator::Replicator::new().await });
+    let replicator = runtime.block_on(async {
+        replicator::Replicator::create(replicator::Options {
+            create_bucket_if_not_exists: true,
+        })
+        .await
+    });
     let mut replicator = match replicator {
         Ok(repl) => repl,
         Err(e) => {

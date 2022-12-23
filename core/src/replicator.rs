@@ -33,10 +33,22 @@ pub enum RestoreAction {
     ReuseGeneration(uuid::Uuid),
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct Options {
+    pub create_bucket_if_not_exists: bool,
+}
+
 impl Replicator {
     pub const UNSET_PAGE_SIZE: usize = usize::MAX;
 
     pub async fn new() -> Result<Self> {
+        Self::create(Options {
+            create_bucket_if_not_exists: false,
+        })
+        .await
+    }
+
+    pub async fn create(options: Options) -> Result<Self> {
         let write_buffer = HashMap::new();
         let mut loader = aws_config::from_env();
         if let Ok(endpoint) = std::env::var("LIBSQL_BOTTOMLESS_ENDPOINT") {
@@ -51,10 +63,18 @@ impl Replicator {
         match client.head_bucket().bucket(&bucket).send().await {
             Ok(_) => tracing::info!("Bucket {} exists and is accessible", bucket),
             Err(aws_sdk_s3::types::SdkError::ServiceError(err)) if err.err().is_not_found() => {
-                tracing::info!("Bucket {} not found, recreating", bucket);
-                client.create_bucket().bucket(&bucket).send().await?;
+                if options.create_bucket_if_not_exists {
+                    tracing::info!("Bucket {} not found, recreating", bucket);
+                    client.create_bucket().bucket(&bucket).send().await?;
+                } else {
+                    tracing::error!("Bucket {} does not exist", bucket);
+                    return Err(aws_sdk_s3::types::SdkError::ServiceError(err).into());
+                }
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                tracing::error!("{}", e);
+                return Err(e.into());
+            }
         }
 
         Ok(Self {

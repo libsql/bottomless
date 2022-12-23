@@ -1,6 +1,6 @@
 [package]
 name = "bottomless-cli"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 license = "MIT"
 keywords = ["libsql", "sqlite", "s3", "cli", "replication"]
@@ -18,5 +18,6 @@ bottomless = { version = "0", path = "../core" }
 chrono = "0.4.23"
 clap = { version = "4.0.29", features = ["derive"] }
 tokio = { version = "1.23.0", features = ["macros", "rt", "rt-multi-thread"] }
+tracing = "0.1.37"
 tracing-subscriber = "0.3.16"
 uuid = { version = "1.2.2", features = ["v7"] }

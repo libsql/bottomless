@@ -253,6 +253,29 @@ impl Replicator {
         self.print_snapshot_summary(&generation).await?;
         Ok(())
     }
+
+    async fn detect_db(&self) -> Option<String> {
+        let response = match self
+            .client
+            .list_objects()
+            .bucket(&self.bucket)
+            .set_delimiter(Some("/".to_string()))
+            .prefix(&self.db_name)
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(_) => return None,
+        };
+
+        let prefix = response.common_prefixes()?.first()?.prefix()?;
+        // 38 is the length of the uuid part
+        if let Some('-') = prefix.chars().nth(prefix.len().saturating_sub(38)) {
+            Some(prefix[..prefix.len().saturating_sub(38)].to_owned())
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -266,7 +289,7 @@ struct Cli {
     #[clap(long, short)]
     bucket: Option<String>,
     #[clap(long, short)]
-    database: String,
+    database: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -338,7 +361,22 @@ async fn run() -> Result<()> {
     }
 
     let mut client = Replicator::new().await?;
-    client.register_db(options.database);
+
+    let database = match options.database {
+        Some(db) => db,
+        None => {
+            match client.detect_db().await {
+                Some(db) => db,
+                None => {
+                    println!("Could not autodetect the database. Please pass it explicitly with -d option");
+                    return Ok(());
+                }
+            }
+        }
+    };
+    tracing::info!("Database: {}", database);
+
+    client.register_db(database);
 
     match options.command {
         Commands::Ls {
