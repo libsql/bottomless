@@ -28,7 +28,15 @@ INSERT INTO test VALUES (zeroblob(1000000));
 INSERT INTO test VALUES (zeroblob(1000000));
 ROLLBACK;
 
+PRAGMA wal_checkpoint(FULL);
+
 INSERT INTO test VALUES (3.14);
+INSERT INTO test VALUES (zeroblob(31400));
+
+PRAGMA wal_checkpoint(PASSIVE);
+PRAGMA wal_checkpoint(PASSIVE);
+
+INSERT INTO test VALUES (997);
 
 SELECT v, length(v) FROM test;
 .exit

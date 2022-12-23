@@ -250,20 +250,20 @@ pub extern "C" fn xCheckpoint(
     frames_in_wal: *mut i32,
     backfilled_frames: *mut i32,
 ) -> i32 {
-    tracing::debug!("Checkpoint");
+    tracing::trace!("Checkpoint");
 
-    /* In order to avoid partial checkpoints, passive checkpoint mode
-     ** is not allowed. Only FULL, RESTART and TRUNCATE checkpoints
-     ** are accepted, because these are guaranteed to block writes
-     ** and copy all WAL pages back into the main database file.
+    /* In order to avoid partial checkpoints, passive checkpoint
+     ** mode is not allowed. Only TRUNCATE checkpoints are accepted,
+     ** because these are guaranteed to block writes and copy all
+     ** WAL pages back into the main database file.
      ** In order to make this mechanism work smoothly with the final
      ** checkpoint on WAL close as well as default autocheckpoints,
      ** mode is upgraded to SQLITE_CHECKPOINT_FULL if it's passive.
      ** An alternative to consider is to just refuse passive checkpoints.
      */
-    let emode = if emode < ffi::SQLITE_CHECKPOINT_FULL {
-        tracing::debug!("Upgrading passive checkpoint to FULL mode");
-        ffi::SQLITE_CHECKPOINT_FULL
+    let emode = if emode < ffi::SQLITE_CHECKPOINT_TRUNCATE {
+        tracing::debug!("Upgrading checkpoint to TRUNCATE mode");
+        ffi::SQLITE_CHECKPOINT_TRUNCATE
     } else {
         emode
     };
@@ -271,7 +271,7 @@ pub extern "C" fn xCheckpoint(
      ** since we auto-upgrade the passive checkpoint
      */
     let busy_handler = if (busy_handler as *const c_void).is_null() {
-        tracing::debug!("Falling back to the default busy handler - always wait");
+        tracing::trace!("Falling back to the default busy handler - always wait");
         always_wait
     } else {
         busy_handler
