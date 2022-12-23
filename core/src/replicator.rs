@@ -349,10 +349,18 @@ impl Replicator {
         Ok(())
     }
 
-    //FIXME: assumes that this bucket stores *only* generations,
-    // it should be more robust
+    //FIXME: assumes that this bucket stores *only* generations for databases,
+    // it should be more robust and continue looking if the first item does not
+    // match the <db-name>-<generation-uuid>/ pattern.
     pub async fn find_newest_generation(&self) -> Option<uuid::Uuid> {
-        let response = self.list_objects().max_keys(1).send().await.ok()?;
+        let prefix = format!("{}-", self.db_name);
+        let response = self
+            .list_objects()
+            .prefix(prefix)
+            .max_keys(1)
+            .send()
+            .await
+            .ok()?;
         let objs = response.contents()?;
         let key = objs.first()?.key()?;
         let key = match key.find('/') {

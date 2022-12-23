@@ -264,6 +264,8 @@ struct Cli {
     #[clap(long, short)]
     endpoint: Option<String>,
     #[clap(long, short)]
+    bucket: Option<String>,
+    #[clap(long, short)]
     database: String,
 }
 
@@ -323,8 +325,7 @@ enum Commands {
     },
 }
 
-#[tokio::main]
-async fn main() {
+async fn run() -> Result<()> {
     tracing_subscriber::fmt::init();
     let options = Cli::parse();
 
@@ -332,7 +333,11 @@ async fn main() {
         std::env::set_var("LIBSQL_BOTTOMLESS_ENDPOINT", ep)
     }
 
-    let mut client = Replicator::new().await.unwrap();
+    if let Some(bucket) = options.bucket {
+        std::env::set_var("LIBSQL_BOTTOMLESS_BUCKET", bucket)
+    }
+
+    let mut client = Replicator::new().await?;
     client.register_db(options.database);
 
     match options.command {
@@ -343,16 +348,17 @@ async fn main() {
             newer_than,
             verbose,
         } => match generation {
-            Some(gen) => client.list_generation(gen).await.unwrap(),
-            None => client
-                .list_generations(limit, older_than, newer_than, verbose)
-                .await
-                .unwrap(),
+            Some(gen) => client.list_generation(gen).await?,
+            None => {
+                client
+                    .list_generations(limit, older_than, newer_than, verbose)
+                    .await?
+            }
         },
         Commands::Restore { generation } => {
             match generation {
-                Some(gen) => client.restore_from(gen).await.unwrap(),
-                None => client.restore().await.unwrap(),
+                Some(gen) => client.restore_from(gen).await?,
+                None => client.restore().await?,
             };
         }
         Commands::Rm {
@@ -360,12 +366,21 @@ async fn main() {
             older_than,
             verbose,
         } => match (generation, older_than) {
-            (None, Some(older_than)) => client.remove_many(older_than, verbose).await.unwrap(),
-            (Some(generation), None) => client.remove(generation, verbose).await.unwrap(),
+            (None, Some(older_than)) => client.remove_many(older_than, verbose).await?,
+            (Some(generation), None) => client.remove(generation, verbose).await?,
             (Some(_), Some(_)) => unreachable!(),
             (None, None) => println!(
                 "rm command cannot be run without parameters; see -h or --help for details"
             ),
         },
+    };
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("Error: {}", e);
+        std::process::exit(1)
     }
 }
