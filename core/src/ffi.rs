@@ -127,7 +127,6 @@ pub struct Wal {
     pub replicator_context: *mut ReplicatorContext,
 }
 
-// Only here for creating a Wal struct instance, we're not going to use it
 #[repr(C)]
 pub struct WalIndexHdr {
     version: u32,
@@ -138,7 +137,7 @@ pub struct WalIndexHdr {
     page_size: u16,
     pub(crate) last_valid_frame: u32,
     n_pages: u32,
-    frame_checksum: [u32; 2],
+    pub(crate) frame_checksum: [u32; 2],
     salt: [u32; 2],
     checksum: [u32; 2],
 }
@@ -181,7 +180,7 @@ pub struct libsql_wal_methods {
         wal: *mut Wal,
         page_size: u32,
         page_headers: *const PgHdr,
-        size_after: i32,
+        size_after: u32,
         is_commit: i32,
         sync_flags: i32,
     ) -> i32,

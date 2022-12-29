@@ -191,7 +191,7 @@ pub extern "C" fn xFrames(
     wal: *mut Wal,
     page_size: u32,
     page_headers: *const PgHdr,
-    size_after: i32,
+    size_after: u32,
     is_commit: i32,
     sync_flags: i32,
 ) -> i32 {
@@ -209,27 +209,49 @@ pub extern "C" fn xFrames(
         return ffi::SQLITE_IOERR_WRITE;
     }
     for (pgno, data) in ffi::PageHdrIter::new(page_headers, page_size as usize) {
-        ctx.replicator.write(pgno, data);
+        ctx.replicator.write(pgno, size_after, data);
     }
 
+    let mut last_consistent_frame = 0;
     if is_commit != 0 {
-        let result = ctx
+        last_consistent_frame = match ctx
             .runtime
-            .block_on(async { ctx.replicator.commit().await });
-        if let Err(e) = result {
-            tracing::error!("Failed to replicate: {}", e);
-            return ffi::SQLITE_IOERR_WRITE;
-        }
+            .block_on(async { ctx.replicator.commit().await })
+        {
+            Ok(frame) => frame,
+            Err(e) => {
+                tracing::error!("Failed to replicate: {}", e);
+                return ffi::SQLITE_IOERR_WRITE;
+            }
+        };
     }
 
-    (orig_methods.xFrames)(
+    let rc = (orig_methods.xFrames)(
         wal,
         page_size,
         page_headers,
         size_after,
         is_commit,
         sync_flags,
-    )
+    );
+    if rc != ffi::SQLITE_OK {
+        return rc;
+    }
+
+    if is_commit != 0 {
+        let frame_checksum = unsafe { (*wal).hdr.frame_checksum };
+
+        if let Err(e) = ctx.runtime.block_on(async {
+            ctx.replicator
+                .finalize_commit(last_consistent_frame, frame_checksum)
+                .await
+        }) {
+            tracing::error!("Failed to finalize replication: {}", e);
+            return ffi::SQLITE_IOERR_WRITE;
+        }
+    }
+
+    ffi::SQLITE_OK
 }
 
 extern "C" fn always_wait(_busy_param: *mut c_void) -> i32 {

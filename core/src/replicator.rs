@@ -7,9 +7,16 @@ use std::collections::HashMap;
 pub type Result<T> = anyhow::Result<T>;
 
 #[derive(Debug)]
+struct Frame {
+    pgno: i32,
+    size_after: u32,
+    bytes: BytesMut,
+}
+
+#[derive(Debug)]
 pub struct Replicator {
     pub client: Client,
-    write_buffer: HashMap<u32, (i32, BytesMut)>,
+    write_buffer: HashMap<u32, Frame>,
 
     pub page_size: usize,
     generation: uuid::Uuid,
@@ -168,22 +175,44 @@ impl Replicator {
         }
     }
 
-    pub fn write(&mut self, pgno: i32, data: &[u8]) {
+    pub fn write(&mut self, pgno: i32, size_after: u32, data: &[u8]) {
         let frame = self.next_frame();
-        tracing::trace!("Writing page {}:{} at frame {}", pgno, data.len(), frame);
+        tracing::trace!(
+            "Writing page {}:{} at frame {}. Size-after: {}",
+            pgno,
+            data.len(),
+            frame,
+            size_after
+        );
         let mut bytes = BytesMut::new();
         bytes.extend_from_slice(data);
-        self.write_buffer.insert(frame, (pgno, bytes));
+        self.write_buffer.insert(
+            frame,
+            Frame {
+                pgno,
+                size_after,
+                bytes,
+            },
+        );
     }
 
-    // Sends the pages participating in a commit to S3
-    pub async fn commit(&mut self) -> Result<()> {
+    // Sends the pages participating in a commit to S3.
+    // Returns the frame number guaranteed to hold the newest transaction
+    pub async fn commit(&mut self) -> Result<u32> {
         tracing::trace!("Committing {} frames", self.write_buffer.len());
         self.commits_in_current_generation += 1;
         let mut tasks = vec![];
         // FIXME: instead of batches processed in bursts, better to allow X concurrent tasks with a semaphore
         const CONCURRENCY: usize = 64;
-        for (frame, (pgno, bytes)) in self.write_buffer.iter() {
+        for (
+            frame,
+            Frame {
+                pgno,
+                size_after,
+                bytes,
+            },
+        ) in self.write_buffer.iter()
+        {
             let data: &[u8] = bytes;
             if data.len() != self.page_size {
                 tracing::warn!("Unexpected truncated page of size {}", data.len())
@@ -192,8 +221,8 @@ impl Replicator {
             let mut compressed: Vec<u8> = Vec::with_capacity(self.page_size);
             tokio::io::copy(&mut compressor, &mut compressed).await?;
             let key = format!(
-                "{}-{}/{:012}-{:012}",
-                self.db_name, self.generation, frame, pgno
+                "{}-{}/{:012}-{:012}-{:012}",
+                self.db_name, self.generation, frame, pgno, size_after
             );
             tracing::trace!("Committing {} (compressed size: {})", key, compressed.len());
             tasks.push(
@@ -213,18 +242,26 @@ impl Replicator {
             futures::future::try_join_all(tasks).await?;
         }
         self.write_buffer.clear();
+        Ok(self.next_frame - 1)
+    }
+
+    pub async fn finalize_commit(&self, last_frame: u32, checksum: [u32; 2]) -> Result<()> {
         // Last consistent frame is persisted in S3 in order to be able to recover
         // from failured that happen in the middle of a commit, when only some
         // of the pages that belong to a transaction are replicated.
+        tracing::error!("Finalizing {} with checksum {:?}", last_frame, checksum);
         let last_consistent_frame_key = format!("{}-{}/.consistent", self.db_name, self.generation);
-        tracing::debug!("Last consistent frame: {}", self.next_frame - 1);
+        tracing::debug!("Finalizing frame: {}, checksum: {:?}", last_frame, checksum);
+        // Information kept in this entry: [last consistent frame number: 4 bytes][last checksum: 8 bytes]
+        let mut consistent_info = BytesMut::with_capacity(12);
+        consistent_info.extend_from_slice(&last_frame.to_be_bytes());
+        consistent_info.extend_from_slice(&checksum[0].to_be_bytes());
+        consistent_info.extend_from_slice(&checksum[1].to_be_bytes());
         self.client
             .put_object()
             .bucket(&self.bucket)
             .key(last_consistent_frame_key)
-            .body(ByteStream::from(Bytes::copy_from_slice(
-                &(self.next_frame - 1).to_be_bytes(),
-            )))
+            .body(ByteStream::from(Bytes::from(consistent_info)))
             .send()
             .await?;
         tracing::trace!("Commit successful");
@@ -296,14 +333,14 @@ impl Replicator {
         for offset in (32..len).step_by(self.page_size + 24) {
             wal_file.seek(tokio::io::SeekFrom::Start(offset)).await?;
             let pgno = wal_file.read_i32().await?;
-            let size_after = wal_file.read_i32().await?;
+            let size_after = wal_file.read_u32().await?;
             tracing::trace!("Size after transaction for {}: {}", pgno, size_after);
             wal_file
                 .seek(tokio::io::SeekFrom::Start(offset + 24))
                 .await?;
             let mut data = vec![0u8; self.page_size];
             wal_file.read_exact(&mut data).await?;
-            self.write(pgno, &data);
+            self.write(pgno, size_after, &data);
             // In multi-page transactions, only the last page in the transaction contains
             // the size_after_transaction field. If it's zero, it means it's an uncommited
             // page.
@@ -408,7 +445,7 @@ impl Replicator {
         Ok(remote_change_counter)
     }
 
-    pub async fn get_last_consistent_frame(&self, generation: &uuid::Uuid) -> Result<u32> {
+    pub async fn get_last_consistent_frame(&self, generation: &uuid::Uuid) -> Result<(u32, u64)> {
         use bytes::Buf;
         Ok(
             match self
@@ -417,8 +454,11 @@ impl Replicator {
                 .await
                 .ok()
             {
-                Some(response) => response.body.collect().await?.get_u32(),
-                None => 0,
+                Some(response) => {
+                    let mut collected = response.body.collect().await?;
+                    (collected.get_u32(), collected.get_u64())
+                }
+                None => (0, 0),
             },
         )
     }
@@ -454,13 +494,15 @@ impl Replicator {
         }
     }
 
-    fn parse_frame_and_page_numbers(key: &str) -> Option<(u32, i32)> {
-        // Format: <generation>/<db-name>-<frame-number>-<page-number>
-        let page_delim = key.rfind('-')?;
+    fn parse_frame_metadata(key: &str) -> Option<(u32, i32, u32)> {
+        // Format: <db-name>-<generation>/<frame-number>-<page-number>-<size-after>
+        let size_after_delim = key.rfind('-')?;
+        let page_delim = key[0..size_after_delim].rfind('-')?;
         let frame_delim = key[0..page_delim].rfind('/')?;
         let frameno = key[frame_delim + 1..page_delim].parse::<u32>().ok()?;
-        let pgno = key[page_delim + 1..].parse::<i32>().ok()?;
-        Some((frameno, pgno))
+        let pgno = key[page_delim + 1..size_after_delim].parse::<i32>().ok()?;
+        let size_after = key[size_after_delim + 1..].parse::<u32>().ok()?;
+        Some((frameno, pgno, size_after))
     }
 
     pub async fn restore_from(&mut self, generation: uuid::Uuid) -> Result<RestoreAction> {
@@ -483,8 +525,12 @@ impl Replicator {
         let remote_counter = self.get_remote_change_counter(&generation).await?;
         tracing::debug!("Counters: l={:?}, r={:?}", local_counter, remote_counter);
 
-        let last_consistent_frame = self.get_last_consistent_frame(&generation).await?;
-        tracing::debug!("Last consistent remote frame: {}", last_consistent_frame);
+        let (last_consistent_frame, checksum) = self.get_last_consistent_frame(&generation).await?;
+        tracing::debug!(
+            "Last consistent remote frame: {}; checksum: {:x}",
+            last_consistent_frame,
+            checksum
+        );
 
         match local_counter.cmp(&remote_counter) {
             Ordering::Equal => {
@@ -565,16 +611,19 @@ impl Replicator {
                 tracing::debug!("Loading {}", key);
                 let frame = self.get_object(key.into()).send().await?;
 
-                let (frameno, pgno) = match Self::parse_frame_and_page_numbers(key) {
+                let (frameno, pgno, size_after) = match Self::parse_frame_metadata(key) {
                     Some(result) => result,
                     None => {
                         tracing::debug!("Failed to parse frame/page from key {}", key);
                         continue;
                     }
                 };
+                if size_after > 0 {
+                    tracing::trace!("Applying last frame of a transaction. Database size after the transaction: {}", size_after);
+                }
                 if frameno > last_consistent_frame {
-                    tracing::warn!("Remote log contains frame {} larger than last consistent frame ({}), stopping the restoration process",
-                                frameno, last_consistent_frame);
+                    tracing::warn!("Remote log contains frame {} larger than last consistent frame ({}), stopping the restoration process. size_after field of this frame is {}",
+                                frameno, last_consistent_frame, size_after);
                     break;
                 }
                 let body_reader = frame.body.into_async_read();
