@@ -307,6 +307,10 @@ impl Replicator {
             return Ok(());
         }
         tracing::trace!("Local WAL pages: {}", (len - 32) / self.page_size as u64);
+        wal_file.seek(tokio::io::SeekFrom::Start(24)).await?;
+        let checksum: [u32; 2] = [wal_file.read_u32().await?, wal_file.read_u32().await?];
+        tracing::trace!("Local WAL checksum: {:?}", checksum);
+        let mut last_written_frame = 0;
         for offset in (32..len).step_by(self.page_size + 24) {
             wal_file.seek(tokio::io::SeekFrom::Start(offset)).await?;
             let pgno = wal_file.read_i32().await?;
@@ -322,8 +326,11 @@ impl Replicator {
             // the size_after_transaction field. If it's zero, it means it's an uncommited
             // page.
             if size_after != 0 {
-                self.commit().await?;
+                last_written_frame = self.commit().await?;
             }
+        }
+        if last_written_frame > 0 {
+            self.finalize_commit(last_written_frame, checksum).await?;
         }
         if !self.write_buffer.is_empty() {
             tracing::warn!("Uncommited WAL entries: {}", self.write_buffer.len());
