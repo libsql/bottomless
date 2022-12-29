@@ -9,7 +9,6 @@ pub type Result<T> = anyhow::Result<T>;
 #[derive(Debug)]
 struct Frame {
     pgno: i32,
-    size_after: u32,
     bytes: BytesMut,
 }
 
@@ -175,25 +174,12 @@ impl Replicator {
         }
     }
 
-    pub fn write(&mut self, pgno: i32, size_after: u32, data: &[u8]) {
+    pub fn write(&mut self, pgno: i32, data: &[u8]) {
         let frame = self.next_frame();
-        tracing::trace!(
-            "Writing page {}:{} at frame {}. Size-after: {}",
-            pgno,
-            data.len(),
-            frame,
-            size_after
-        );
+        tracing::trace!("Writing page {}:{} at frame {}", pgno, data.len(), frame,);
         let mut bytes = BytesMut::new();
         bytes.extend_from_slice(data);
-        self.write_buffer.insert(
-            frame,
-            Frame {
-                pgno,
-                size_after,
-                bytes,
-            },
-        );
+        self.write_buffer.insert(frame, Frame { pgno, bytes });
     }
 
     // Sends the pages participating in a commit to S3.
@@ -204,15 +190,7 @@ impl Replicator {
         let mut tasks = vec![];
         // FIXME: instead of batches processed in bursts, better to allow X concurrent tasks with a semaphore
         const CONCURRENCY: usize = 64;
-        for (
-            frame,
-            Frame {
-                pgno,
-                size_after,
-                bytes,
-            },
-        ) in self.write_buffer.iter()
-        {
+        for (frame, Frame { pgno, bytes }) in self.write_buffer.iter() {
             let data: &[u8] = bytes;
             if data.len() != self.page_size {
                 tracing::warn!("Unexpected truncated page of size {}", data.len())
@@ -221,8 +199,8 @@ impl Replicator {
             let mut compressed: Vec<u8> = Vec::with_capacity(self.page_size);
             tokio::io::copy(&mut compressor, &mut compressed).await?;
             let key = format!(
-                "{}-{}/{:012}-{:012}-{:012}",
-                self.db_name, self.generation, frame, pgno, size_after
+                "{}-{}/{:012}-{:012}",
+                self.db_name, self.generation, frame, pgno
             );
             tracing::trace!("Committing {} (compressed size: {})", key, compressed.len());
             tasks.push(
@@ -249,7 +227,6 @@ impl Replicator {
         // Last consistent frame is persisted in S3 in order to be able to recover
         // from failured that happen in the middle of a commit, when only some
         // of the pages that belong to a transaction are replicated.
-        tracing::error!("Finalizing {} with checksum {:?}", last_frame, checksum);
         let last_consistent_frame_key = format!("{}-{}/.consistent", self.db_name, self.generation);
         tracing::debug!("Finalizing frame: {}, checksum: {:?}", last_frame, checksum);
         // Information kept in this entry: [last consistent frame number: 4 bytes][last checksum: 8 bytes]
@@ -340,7 +317,7 @@ impl Replicator {
                 .await?;
             let mut data = vec![0u8; self.page_size];
             wal_file.read_exact(&mut data).await?;
-            self.write(pgno, size_after, &data);
+            self.write(pgno, &data);
             // In multi-page transactions, only the last page in the transaction contains
             // the size_after_transaction field. If it's zero, it means it's an uncommited
             // page.
@@ -494,15 +471,13 @@ impl Replicator {
         }
     }
 
-    fn parse_frame_metadata(key: &str) -> Option<(u32, i32, u32)> {
-        // Format: <db-name>-<generation>/<frame-number>-<page-number>-<size-after>
-        let size_after_delim = key.rfind('-')?;
-        let page_delim = key[0..size_after_delim].rfind('-')?;
+    fn parse_frame_and_page_numbers(key: &str) -> Option<(u32, i32)> {
+        // Format: <db-name>-<generation>/<frame-number>-<page-number>
+        let page_delim = key.rfind('-')?;
         let frame_delim = key[0..page_delim].rfind('/')?;
         let frameno = key[frame_delim + 1..page_delim].parse::<u32>().ok()?;
-        let pgno = key[page_delim + 1..size_after_delim].parse::<i32>().ok()?;
-        let size_after = key[size_after_delim + 1..].parse::<u32>().ok()?;
-        Some((frameno, pgno, size_after))
+        let pgno = key[page_delim + 1..].parse::<i32>().ok()?;
+        Some((frameno, pgno))
     }
 
     pub async fn restore_from(&mut self, generation: uuid::Uuid) -> Result<RestoreAction> {
@@ -611,19 +586,17 @@ impl Replicator {
                 tracing::debug!("Loading {}", key);
                 let frame = self.get_object(key.into()).send().await?;
 
-                let (frameno, pgno, size_after) = match Self::parse_frame_metadata(key) {
+                let (frameno, pgno) = match Self::parse_frame_and_page_numbers(key) {
                     Some(result) => result,
                     None => {
                         tracing::debug!("Failed to parse frame/page from key {}", key);
                         continue;
                     }
                 };
-                if size_after > 0 {
-                    tracing::trace!("Applying last frame of a transaction. Database size after the transaction: {}", size_after);
-                }
+                tracing::error!("PARSED {} {}", frameno, pgno);
                 if frameno > last_consistent_frame {
-                    tracing::warn!("Remote log contains frame {} larger than last consistent frame ({}), stopping the restoration process. size_after field of this frame is {}",
-                                frameno, last_consistent_frame, size_after);
+                    tracing::warn!("Remote log contains frame {} larger than last consistent frame ({}), stopping the restoration process",
+                                frameno, last_consistent_frame);
                     break;
                 }
                 let body_reader = frame.body.into_async_read();

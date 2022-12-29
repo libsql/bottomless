@@ -209,7 +209,7 @@ pub extern "C" fn xFrames(
         return ffi::SQLITE_IOERR_WRITE;
     }
     for (pgno, data) in ffi::PageHdrIter::new(page_headers, page_size as usize) {
-        ctx.replicator.write(pgno, size_after, data);
+        ctx.replicator.write(pgno, data);
     }
 
     let mut last_consistent_frame = 0;
