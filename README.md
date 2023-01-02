@@ -23,7 +23,7 @@ export LIBSQL_BOTTOMLESS_ENDPOINT='http://localhost:9042'
 
 Bucket used for replication can be configured with:
 ```
-export LIBSQL_BOTTOMLESS_BUCKET='http://localhost:9042'
+export LIBSQL_BOTTOMLESS_BUCKET='custom-bucket'
 ```
 
 On top of that, bottomless is implemented on top of the official [Rust SDK for S3](https://crates.io/crates/aws-sdk-s3), so all AWS-specific environment variables like `AWS_DEFAULT_REGION`, `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` also work, as well as the `~/.aws/credentials` file.
@@ -33,9 +33,12 @@ From libSQL/SQLite shell, load the extension and open a database file with `bott
 ```sql
 .load ../target/debug/bottomless
 .open file:test.db?wal=bottomless
+PRAGMA page_size=65536;
 PRAGMA journal_mode=wal;
 ```
 Remember to set the journaling mode to `WAL`, which needs to be done at least once, before writing any content, otherwise the custom WAL implementation will not be used.
+
+The recommended page size for replicated WAL is the maximum - 64KiB. Most S3-compatible storage vendors have minimum billable object size set to ~128KiB anyway.
 
 In order to customize logging, use `RUST_LOG` env variable, e.g. `RUST_LOG=info ./libsql`.
 
@@ -81,6 +84,7 @@ e4eb3c21-ff53-7b2e-a6ea-ca396f4df9b1
 	created at (UTC):     2022-12-23 08:24:52.500
 	change counter:       [0, 0, 0, 51]
 	consistent WAL frame: 0
+	WAL frame checksum:   0
 	main database snapshot:
 		object size:   408
 		last modified: 2022-12-23T08:24:53Z
@@ -89,6 +93,7 @@ e4eb3c22-0359-7af6-9acb-285ed7b6ed59
 	created at (UTC):     2022-12-23 08:24:51.470
 	change counter:       [0, 0, 0, 51]
 	consistent WAL frame: 1
+	WAL frame checksum:   5335f2a044d2f455
 	main database snapshot:
 		object size:   399
 		last modified: 2022-12-23T08:24:52Z
@@ -97,6 +102,7 @@ e4eb3c22-0941-73eb-85df-4e8552a0e88c
 	created at (UTC):     2022-12-23 08:24:49.958
 	change counter:       [0, 0, 0, 50]
 	consistent WAL frame: 10
+	WAL frame checksum:   6ac65882f9a2dba7
 	main database snapshot:
 		object size:   401
 		last modified: 2022-12-23T08:24:51Z
@@ -120,3 +126,20 @@ Removed 4 generations
 ## Details
 All page writes committed to the database end up being synchronously replicated to S3-compatible storage.
 On boot, if the main database file is empty, it will be restored with data coming from the remote storage.
+If the database file is newer, it will be uploaded to the remote location with a new generation number.
+If a local WAL file is present and detected to be newer than remote data, it will be uploaded as well.
+
+### Tests
+A fully local test can be performed by using a local S3-compatible server, e.g. [Minio](https://min.io/). Assuming the server is available at HTTP port 9000,
+you can use the following scripts:
+```sh
+cd test/
+export LIBSQL_BOTTOMLESS_ENDPOINT=http://localhost:9000
+./smoke_test.sh
+./restore_test.sh
+```
+
+The `smoke_test` script sets up a new database in WAL mode and 64KiB page size - test.db - and then inserts a few records into the database.
+The `restore_test` script syncs with the replication server and fetches the newest database if necessary. Once `smoke_test` ran at least once, `restore_test` should always be able to fetch the database data, even if the local `test.db` file is removed.
+
+The same set of tests also work with remote servers. In case of AWS S3, just make sure that the AWS SDK credentials are valid and the user has permissions for managing the chosen bucket.
