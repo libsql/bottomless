@@ -2,7 +2,9 @@
 .echo on
 .load ../target/debug/bottomless
 .open file:test.db?wal=bottomless
+PRAGMA page_size=65536;
 PRAGMA journal_mode=wal;
+PRAGMA page_size;
 DROP TABLE IF EXISTS test;
 CREATE TABLE test(v);
 INSERT INTO test VALUES (42);
