@@ -114,28 +114,37 @@ impl Replicator {
         Ok(())
     }
 
+    // Gets an object from the current bucket
     fn get_object(&self, key: String) -> aws_sdk_s3::client::fluent_builders::GetObject {
         self.client.get_object().bucket(&self.bucket).key(key)
     }
 
+    // Lists objects from the current bucket
     fn list_objects(&self) -> aws_sdk_s3::client::fluent_builders::ListObjects {
         self.client.list_objects().bucket(&self.bucket)
     }
 
+    // Generates a new generation UUID v7, which contains a timestamp and is binary-sortable.
+    // This timestamp goes back in time - that allows us to list newest generations
+    // first in the S3-compatible bucket, under the assumption that fetching newest generations
+    // is the most common operation.
+    // NOTICE: at the time of writing, uuid v7 is an unstable feature of the uuid crate
     fn generate_generation() -> uuid::Uuid {
-        // This timestamp goes back in time - that allows us to list newest generations
-        // first in the S3 bucket.
         let (seconds, nanos) = uuid::timestamp::Timestamp::now(uuid::NoContext).to_unix();
         let (seconds, nanos) = (253370761200 - seconds, 999999999 - nanos);
         let synthetic_ts = uuid::Timestamp::from_unix(uuid::NoContext, seconds, nanos);
         uuid::Uuid::new_v7(synthetic_ts)
     }
 
+    // Starts a new generation for this replicator instance
     pub fn new_generation(&mut self) {
         tracing::debug!("New generation started: {}", self.generation);
         self.set_generation(Self::generate_generation());
     }
 
+    // Sets a generation for this replicator instance. This function
+    // should be called if a generation number from S3-compatible storage
+    // is reused in this session.
     pub fn set_generation(&mut self, generation: uuid::Uuid) {
         self.generation = generation;
         self.commits_in_current_generation = 0;
@@ -143,6 +152,7 @@ impl Replicator {
         tracing::debug!("Generation set to {}", self.generation);
     }
 
+    // Registers a database path for this replicator.
     pub fn register_db(&mut self, db_path: impl Into<String>) {
         let db_path = db_path.into();
         let name = match db_path.rfind('/') {
@@ -151,18 +161,21 @@ impl Replicator {
         };
         self.db_path = db_path;
         self.db_name = name;
-        tracing::debug!("Registered {} (full path: {})", self.db_name, self.db_path);
+        tracing::trace!("Registered {} (full path: {})", self.db_name, self.db_path);
     }
 
+    // Returns the next free frame number for the replicated log
     fn next_frame(&mut self) -> u32 {
         self.next_frame += 1;
         self.next_frame - 1
     }
 
+    // Returns the current last valid frame in the replicated log
     pub fn peek_last_valid_frame(&self) -> u32 {
         self.next_frame.saturating_sub(1)
     }
 
+    // Sets the last valid frame in the replicated log.
     pub fn register_last_valid_frame(&mut self, frame: u32) {
         if frame != self.peek_last_valid_frame() {
             tracing::error!(
@@ -174,6 +187,7 @@ impl Replicator {
         }
     }
 
+    // Writes pages to a local in-memory buffer
     pub fn write(&mut self, pgno: i32, data: &[u8]) {
         let frame = self.next_frame();
         tracing::trace!("Writing page {}:{} at frame {}", pgno, data.len(), frame,);
@@ -182,10 +196,10 @@ impl Replicator {
         self.write_buffer.insert(frame, Frame { pgno, bytes });
     }
 
-    // Sends the pages participating in a commit to S3.
-    // Returns the frame number guaranteed to hold the newest transaction
-    pub async fn commit(&mut self) -> Result<u32> {
-        tracing::trace!("Committing {} frames", self.write_buffer.len());
+    // Sends pages participating in current transaction to S3.
+    // Returns the frame number holding the last flushed page.
+    pub async fn flush(&mut self) -> Result<u32> {
+        tracing::trace!("Flushing {} frames", self.write_buffer.len());
         self.commits_in_current_generation += 1;
         let mut tasks = vec![];
         // FIXME: instead of batches processed in bursts, better to allow X concurrent tasks with a semaphore
@@ -202,7 +216,7 @@ impl Replicator {
                 "{}-{}/{:012}-{:012}",
                 self.db_name, self.generation, frame, pgno
             );
-            tracing::trace!("Committing {} (compressed size: {})", key, compressed.len());
+            tracing::trace!("Flushing {} (compressed size: {})", key, compressed.len());
             tasks.push(
                 self.client
                     .put_object()
@@ -223,12 +237,14 @@ impl Replicator {
         Ok(self.next_frame - 1)
     }
 
+    // Marks all recently flushed pages as committed and updates the frame number
+    // holding the newest consistent committed transaction.
     pub async fn finalize_commit(&self, last_frame: u32, checksum: [u32; 2]) -> Result<()> {
         // Last consistent frame is persisted in S3 in order to be able to recover
         // from failured that happen in the middle of a commit, when only some
         // of the pages that belong to a transaction are replicated.
         let last_consistent_frame_key = format!("{}-{}/.consistent", self.db_name, self.generation);
-        tracing::debug!("Finalizing frame: {}, checksum: {:?}", last_frame, checksum);
+        tracing::trace!("Finalizing frame: {}, checksum: {:?}", last_frame, checksum);
         // Information kept in this entry: [last consistent frame number: 4 bytes][last checksum: 8 bytes]
         let mut consistent_info = BytesMut::with_capacity(12);
         consistent_info.extend_from_slice(&last_frame.to_be_bytes());
@@ -245,12 +261,14 @@ impl Replicator {
         Ok(())
     }
 
+    // Drops uncommitted frames newer than given last valid frame
     pub fn rollback_to_frame(&mut self, last_valid_frame: u32) {
         // NOTICE: linear, we can migrate write_buffer to BTreeMap if ever needed
         self.write_buffer.retain(|&k, _| k <= last_valid_frame);
         self.next_frame = last_valid_frame + 1;
     }
 
+    // Tries to read the local change counter from the given database file
     async fn read_change_counter(reader: &mut tokio::fs::File) -> Result<[u8; 4]> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
         let mut counter = [0u8; 4];
@@ -259,6 +277,7 @@ impl Replicator {
         Ok(counter)
     }
 
+    // Tries to read the local page size from the given database file
     async fn read_page_size(reader: &mut tokio::fs::File) -> Result<usize> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
         reader.seek(std::io::SeekFrom::Start(16)).await?;
@@ -326,7 +345,7 @@ impl Replicator {
             // the size_after_transaction field. If it's zero, it means it's an uncommited
             // page.
             if size_after != 0 {
-                last_written_frame = self.commit().await?;
+                last_written_frame = self.flush().await?;
             }
         }
         if last_written_frame > 0 {
@@ -340,6 +359,7 @@ impl Replicator {
         Ok(())
     }
 
+    // Check if the local database file exists and contains data
     async fn main_db_exists_and_not_empty(&self) -> bool {
         let file = match tokio::fs::File::open(&self.db_path).await {
             Ok(file) => file,
@@ -390,7 +410,8 @@ impl Replicator {
         Ok(())
     }
 
-    //FIXME: assumes that this bucket stores *only* generations for databases,
+    // Returns newest replicated generation, or None, if one is not found.
+    // FIXME: assumes that this bucket stores *only* generations for databases,
     // it should be more robust and continue looking if the first item does not
     // match the <db-name>-<generation-uuid>/ pattern.
     pub async fn find_newest_generation(&self) -> Option<uuid::Uuid> {
@@ -412,6 +433,7 @@ impl Replicator {
         uuid::Uuid::parse_str(key).ok()
     }
 
+    // Tries to fetch the remote database change counter from given generation
     pub async fn get_remote_change_counter(&self, generation: &uuid::Uuid) -> Result<[u8; 4]> {
         use bytes::Buf;
         let mut remote_change_counter = [0u8; 4];
@@ -429,6 +451,7 @@ impl Replicator {
         Ok(remote_change_counter)
     }
 
+    // Tries to fetch the last consistent frame number stored in the remote generation
     pub async fn get_last_consistent_frame(&self, generation: &uuid::Uuid) -> Result<(u32, u64)> {
         use bytes::Buf;
         Ok(
@@ -447,7 +470,8 @@ impl Replicator {
         )
     }
 
-    async fn get_wal_page_count(&mut self) -> u32 {
+    // Returns the number of pages stored in the local WAL file, or 0, if there aren't any.
+    async fn get_local_wal_page_count(&mut self) -> u32 {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
         match tokio::fs::File::open(&format!("{}-wal", &self.db_path)).await {
             Ok(mut file) => {
@@ -478,8 +502,9 @@ impl Replicator {
         }
     }
 
+    // Parses the frame and page number from given key.
+    // Format: <db-name>-<generation>/<frame-number>-<page-number>
     fn parse_frame_and_page_numbers(key: &str) -> Option<(u32, i32)> {
-        // Format: <db-name>-<generation>/<frame-number>-<page-number>
         let page_delim = key.rfind('-')?;
         let frame_delim = key[0..page_delim].rfind('/')?;
         let frameno = key[frame_delim + 1..page_delim].parse::<u32>().ok()?;
@@ -487,6 +512,7 @@ impl Replicator {
         Some((frameno, pgno))
     }
 
+    // Restores the database state from given remote generation
     pub async fn restore_from(&mut self, generation: uuid::Uuid) -> Result<RestoreAction> {
         use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
@@ -516,7 +542,7 @@ impl Replicator {
 
         match local_counter.cmp(&remote_counter) {
             Ordering::Equal => {
-                let wal_pages = self.get_wal_page_count().await;
+                let wal_pages = self.get_local_wal_page_count().await;
                 tracing::debug!(
                     "Consistent: {}; wal pages: {}",
                     last_consistent_frame,
@@ -611,7 +637,7 @@ impl Replicator {
                     tokio::io::BufReader::new(body_reader),
                 );
                 if self.page_size == Self::UNSET_PAGE_SIZE {
-                    let mut page_buffer = Vec::with_capacity(4096); // best guess for the page size
+                    let mut page_buffer = Vec::with_capacity(65536); // best guess for the page size - it will certainly not be more than 64KiB
                     let page_size =
                         tokio::io::copy(&mut decompress_reader, &mut page_buffer).await?;
                     self.set_page_size(page_size as usize)?;
@@ -649,6 +675,7 @@ impl Replicator {
         }
     }
 
+    // Restores the database state from newest remote generation
     pub async fn restore(&mut self) -> Result<RestoreAction> {
         let newest_generation = match self.find_newest_generation().await {
             Some(gen) => gen,

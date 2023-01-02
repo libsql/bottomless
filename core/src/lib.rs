@@ -213,11 +213,13 @@ pub extern "C" fn xFrames(
     }
 
     let mut last_consistent_frame = 0;
+    // TODO: flushing can be done even if is_commit == 0, in order to drain
+    // the local cache and free its memory. However, that complicates rollbacks (xUndo),
+    // because the flushed-but-not-committed pages should be removed from the remote
+    // location. It's not complicated, but potentially costly in terms of latency,
+    // so for now it is not yet implemented.
     if is_commit != 0 {
-        last_consistent_frame = match ctx
-            .runtime
-            .block_on(async { ctx.replicator.commit().await })
-        {
+        last_consistent_frame = match ctx.runtime.block_on(async { ctx.replicator.flush().await }) {
             Ok(frame) => frame,
             Err(e) => {
                 tracing::error!("Failed to replicate: {}", e);
@@ -276,12 +278,12 @@ pub extern "C" fn xCheckpoint(
 
     /* In order to avoid partial checkpoints, passive checkpoint
      ** mode is not allowed. Only TRUNCATE checkpoints are accepted,
-     ** because these are guaranteed to block writes and copy all
-     ** WAL pages back into the main database file.
+     ** because these are guaranteed to block writes, copy all WAL pages
+     ** back into the main database file and reset the frame number.
      ** In order to make this mechanism work smoothly with the final
      ** checkpoint on WAL close as well as default autocheckpoints,
-     ** mode is upgraded to SQLITE_CHECKPOINT_FULL if it's passive.
-     ** An alternative to consider is to just refuse passive checkpoints.
+     ** the mode is unconditionally upgraded to SQLITE_CHECKPOINT_TRUNCATE.
+     ** An alternative to consider is to just refuse weaker checkpoints.
      */
     let emode = if emode < ffi::SQLITE_CHECKPOINT_TRUNCATE {
         tracing::debug!("Upgrading checkpoint to TRUNCATE mode");
