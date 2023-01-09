@@ -2,25 +2,31 @@ use aws_sdk_s3::types::ByteStream;
 use aws_sdk_s3::{Client, Endpoint};
 use bytes::{Bytes, BytesMut};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 pub type Result<T> = anyhow::Result<T>;
+
+const CRC_64: crc::Crc<u64> = crc::Crc::<u64>::new(&crc::CRC_64_ECMA_182);
 
 #[derive(Debug)]
 struct Frame {
     pgno: i32,
     bytes: BytesMut,
+    crc: u64,
 }
 
 #[derive(Debug)]
 pub struct Replicator {
     pub client: Client,
-    write_buffer: HashMap<u32, Frame>,
+    write_buffer: BTreeMap<u32, Frame>,
 
     pub page_size: usize,
     generation: uuid::Uuid,
     pub commits_in_current_generation: u32,
     next_frame: u32,
+    verify_crc: bool,
+    last_frame_crc: u64,
+    last_transaction_crc: u64,
     pub bucket: String,
     pub db_path: String,
     pub db_name: String,
@@ -42,6 +48,7 @@ pub enum RestoreAction {
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
     pub create_bucket_if_not_exists: bool,
+    pub verify_crc: bool,
 }
 
 impl Replicator {
@@ -50,12 +57,13 @@ impl Replicator {
     pub async fn new() -> Result<Self> {
         Self::create(Options {
             create_bucket_if_not_exists: false,
+            verify_crc: true,
         })
         .await
     }
 
     pub async fn create(options: Options) -> Result<Self> {
-        let write_buffer = HashMap::new();
+        let write_buffer = BTreeMap::new();
         let mut loader = aws_config::from_env();
         if let Ok(endpoint) = std::env::var("LIBSQL_BOTTOMLESS_ENDPOINT") {
             loader = loader.endpoint_resolver(Endpoint::immutable(endpoint)?);
@@ -78,7 +86,7 @@ impl Replicator {
                 }
             }
             Err(e) => {
-                tracing::error!("{}", e);
+                tracing::error!("Bucket checking error: {}", e);
                 return Err(e.into());
             }
         }
@@ -91,6 +99,9 @@ impl Replicator {
             generation,
             commits_in_current_generation: 0,
             next_frame: 1,
+            verify_crc: options.verify_crc,
+            last_frame_crc: 0,
+            last_transaction_crc: 0,
             db_path: String::new(),
             db_name: String::new(),
         })
@@ -190,21 +201,36 @@ impl Replicator {
     // Writes pages to a local in-memory buffer
     pub fn write(&mut self, pgno: i32, data: &[u8]) {
         let frame = self.next_frame();
-        tracing::trace!("Writing page {}:{} at frame {}", pgno, data.len(), frame,);
+        let mut crc = CRC_64.digest_with_initial(self.last_frame_crc);
+        crc.update(data);
+        let crc = crc.finalize();
+        tracing::trace!(
+            "Writing page {}:{} at frame {}, crc: {}",
+            pgno,
+            data.len(),
+            frame,
+            crc
+        );
         let mut bytes = BytesMut::new();
         bytes.extend_from_slice(data);
-        self.write_buffer.insert(frame, Frame { pgno, bytes });
+        self.write_buffer.insert(frame, Frame { pgno, bytes, crc });
+        self.last_frame_crc = crc;
     }
 
     // Sends pages participating in current transaction to S3.
     // Returns the frame number holding the last flushed page.
     pub async fn flush(&mut self) -> Result<u32> {
+        if self.write_buffer.is_empty() {
+            tracing::trace!("Attempting to flush an empty buffer");
+            return Ok(0);
+        }
         tracing::trace!("Flushing {} frames", self.write_buffer.len());
         self.commits_in_current_generation += 1;
         let mut tasks = vec![];
         // FIXME: instead of batches processed in bursts, better to allow X concurrent tasks with a semaphore
         const CONCURRENCY: usize = 64;
-        for (frame, Frame { pgno, bytes }) in self.write_buffer.iter() {
+        let last_frame_in_transaction_crc = self.write_buffer.iter().last().unwrap().1.crc;
+        for (frame, Frame { pgno, bytes, crc }) in self.write_buffer.iter() {
             let data: &[u8] = bytes;
             if data.len() != self.page_size {
                 tracing::warn!("Unexpected truncated page of size {}", data.len())
@@ -213,8 +239,8 @@ impl Replicator {
             let mut compressed: Vec<u8> = Vec::with_capacity(self.page_size);
             tokio::io::copy(&mut compressor, &mut compressed).await?;
             let key = format!(
-                "{}-{}/{:012}-{:012}",
-                self.db_name, self.generation, frame, pgno
+                "{}-{}/{:012}-{:012}-{:016x}",
+                self.db_name, self.generation, frame, pgno, crc
             );
             tracing::trace!("Flushing {} (compressed size: {})", key, compressed.len());
             tasks.push(
@@ -234,12 +260,14 @@ impl Replicator {
             futures::future::try_join_all(tasks).await?;
         }
         self.write_buffer.clear();
+        self.last_transaction_crc = last_frame_in_transaction_crc;
+        tracing::trace!("Last transaction crc: {}", self.last_transaction_crc);
         Ok(self.next_frame - 1)
     }
 
     // Marks all recently flushed pages as committed and updates the frame number
     // holding the newest consistent committed transaction.
-    pub async fn finalize_commit(&self, last_frame: u32, checksum: [u32; 2]) -> Result<()> {
+    pub async fn finalize_commit(&mut self, last_frame: u32, checksum: [u32; 2]) -> Result<()> {
         // Last consistent frame is persisted in S3 in order to be able to recover
         // from failured that happen in the middle of a commit, when only some
         // of the pages that belong to a transaction are replicated.
@@ -263,9 +291,21 @@ impl Replicator {
 
     // Drops uncommitted frames newer than given last valid frame
     pub fn rollback_to_frame(&mut self, last_valid_frame: u32) {
-        // NOTICE: linear, we can migrate write_buffer to BTreeMap if ever needed
+        // NOTICE: O(size), can be optimized to O(removed) if ever needed
         self.write_buffer.retain(|&k, _| k <= last_valid_frame);
         self.next_frame = last_valid_frame + 1;
+        self.last_frame_crc = self
+            .write_buffer
+            .iter()
+            .next_back()
+            .map(|entry| entry.1.crc)
+            .unwrap_or(self.last_transaction_crc);
+        tracing::debug!(
+            "Rolled back to {}, crc {} (last transaction crc = {})",
+            self.next_frame - 1,
+            self.last_frame_crc,
+            self.last_transaction_crc,
+        );
     }
 
     // Tries to read the local change counter from the given database file
@@ -503,13 +543,16 @@ impl Replicator {
     }
 
     // Parses the frame and page number from given key.
-    // Format: <db-name>-<generation>/<frame-number>-<page-number>
-    fn parse_frame_and_page_numbers(key: &str) -> Option<(u32, i32)> {
-        let page_delim = key.rfind('-')?;
+    // Format: <db-name>-<generation>/<frame-number>-<page-number>-<crc64>
+    fn parse_frame_page_crc(key: &str) -> Option<(u32, i32, u64)> {
+        let checksum_delim = key.rfind('-')?;
+        let page_delim = key[0..checksum_delim].rfind('-')?;
         let frame_delim = key[0..page_delim].rfind('/')?;
         let frameno = key[frame_delim + 1..page_delim].parse::<u32>().ok()?;
-        let pgno = key[page_delim + 1..].parse::<i32>().ok()?;
-        Some((frameno, pgno))
+        let pgno = key[page_delim + 1..checksum_delim].parse::<i32>().ok()?;
+        let crc = u64::from_str_radix(&key[checksum_delim + 1..], 16).ok()?;
+        tracing::debug!(frameno, pgno, crc);
+        Some((frameno, pgno, crc))
     }
 
     // Restores the database state from given remote generation
@@ -612,6 +655,8 @@ impl Replicator {
                     break;
                 }
             };
+            let mut prev_crc = 0;
+            let mut page_buffer = Vec::with_capacity(65536); // best guess for the page size - it will certainly not be more than 64KiB
             for obj in objs {
                 let key = obj
                     .key()
@@ -619,14 +664,18 @@ impl Replicator {
                 tracing::debug!("Loading {}", key);
                 let frame = self.get_object(key.into()).send().await?;
 
-                let (frameno, pgno) = match Self::parse_frame_and_page_numbers(key) {
+                let (frameno, pgno, crc) = match Self::parse_frame_page_crc(key) {
                     Some(result) => result,
                     None => {
-                        tracing::debug!("Failed to parse frame/page from key {}", key);
+                        if !key.ends_with(".gz")
+                            && !key.ends_with(".consistent")
+                            && !key.ends_with(".changecounter")
+                        {
+                            tracing::warn!("Failed to parse frame/page from key {}", key);
+                        }
                         continue;
                     }
                 };
-                tracing::error!("PARSED {} {}", frameno, pgno);
                 if frameno > last_consistent_frame {
                     tracing::warn!("Remote log contains frame {} larger than last consistent frame ({}), stopping the restoration process",
                                 frameno, last_consistent_frame);
@@ -636,16 +685,32 @@ impl Replicator {
                 let mut decompress_reader = async_compression::tokio::bufread::GzipDecoder::new(
                     tokio::io::BufReader::new(body_reader),
                 );
-                if self.page_size == Self::UNSET_PAGE_SIZE {
-                    let mut page_buffer = Vec::with_capacity(65536); // best guess for the page size - it will certainly not be more than 64KiB
+                // If page size is unknown *or* crc verification is performed,
+                // a page needs to be loaded to memory first
+                if self.verify_crc || self.page_size == Self::UNSET_PAGE_SIZE {
                     let page_size =
                         tokio::io::copy(&mut decompress_reader, &mut page_buffer).await?;
+                    if self.verify_crc {
+                        let mut expected_crc = CRC_64.digest_with_initial(prev_crc);
+                        expected_crc.update(&page_buffer);
+                        let expected_crc = expected_crc.finalize();
+                        tracing::debug!(crc, expected_crc);
+                        if crc != expected_crc {
+                            tracing::warn!(
+                                "CRC check failed: {:016x} != {:016x} (expected)",
+                                crc,
+                                expected_crc
+                            );
+                        }
+                        prev_crc = crc;
+                    }
                     self.set_page_size(page_size as usize)?;
                     let offset = (pgno - 1) as u64 * page_size;
                     main_db_writer
                         .seek(tokio::io::SeekFrom::Start(offset))
                         .await?;
                     tokio::io::copy(&mut &page_buffer[..], &mut main_db_writer).await?;
+                    page_buffer.clear();
                 } else {
                     let offset = (pgno - 1) as u64 * self.page_size as u64;
                     main_db_writer

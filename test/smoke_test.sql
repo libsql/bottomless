@@ -14,6 +14,9 @@ INSERT INTO test VALUES ('hey');
 
 BEGIN;
 INSERT INTO test VALUES ('presavepoint');
+INSERT INTO test VALUES (zeroblob(1600000));
+INSERT INTO test VALUES (zeroblob(1600000));
+INSERT INTO test VALUES (zeroblob(2400000));
 SAVEPOINT test1;
 INSERT INTO test VALUES (43);
 INSERT INTO test VALUES (zeroblob(2000000));

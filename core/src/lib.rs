@@ -286,7 +286,7 @@ pub extern "C" fn xCheckpoint(
      ** An alternative to consider is to just refuse weaker checkpoints.
      */
     let emode = if emode < ffi::SQLITE_CHECKPOINT_TRUNCATE {
-        tracing::debug!("Upgrading checkpoint to TRUNCATE mode");
+        tracing::trace!("Upgrading checkpoint to TRUNCATE mode");
         ffi::SQLITE_CHECKPOINT_TRUNCATE
     } else {
         emode
@@ -403,6 +403,7 @@ pub extern "C" fn xPreMainDbOpen(_methods: *mut libsql_wal_methods, path: *const
     let replicator = runtime.block_on(async {
         replicator::Replicator::create(replicator::Options {
             create_bucket_if_not_exists: true,
+            verify_crc: true,
         })
         .await
     });
