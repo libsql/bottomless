@@ -422,7 +422,9 @@ impl Replicator {
             .bucket
             .get_object(format!("{}-{}/.changecounter", self.db_name, generation))
         {
-            response.bytes().copy_to_slice(&mut remote_change_counter)
+            if response.status_code() == 200 {
+                response.bytes().copy_to_slice(&mut remote_change_counter)
+            }
         }
         Ok(remote_change_counter)
     }
@@ -437,8 +439,12 @@ impl Replicator {
                 .ok()
             {
                 Some(response) => {
-                    let mut collected = response.bytes();
-                    (collected.get_u32(), collected.get_u64())
+                    if response.status_code() == 200 {
+                        let mut collected = response.bytes();
+                        (collected.get_u32(), collected.get_u64())
+                    } else {
+                        (0, 0)
+                    }
                 }
                 None => (0, 0),
             },
@@ -555,12 +561,14 @@ impl Replicator {
             .bucket
             .get_object(format!("{}-{}/db.gz", self.db_name, generation))
         {
-            let mut decompress_reader =
-                flate2::bufread::GzDecoder::new(std::io::BufReader::new(db_file.bytes()));
-            std::io::copy(&mut decompress_reader, &mut main_db_writer)?;
-            main_db_writer.flush()?;
+            if db_file.status_code() == 200 {
+                let mut decompress_reader =
+                    flate2::bufread::GzDecoder::new(std::io::BufReader::new(db_file.bytes()));
+                std::io::copy(&mut decompress_reader, &mut main_db_writer)?;
+                main_db_writer.flush()?;
+                tracing::info!("Restored the main database file");
+            }
         }
-        tracing::info!("Restored the main database file");
 
         let mut next_marker = None;
         let prefix = format!("{}-{}/", self.db_name, generation);
