@@ -503,6 +503,7 @@ extern "C" {
 }
 
 pub fn register_bottomless_methods() -> Option<()> {
+    bottomless_init();
     let orig_methods = unsafe { libsql_wal_methods_find(std::ptr::null()) };
     if orig_methods.is_null() {
         return None;
