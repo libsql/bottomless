@@ -222,7 +222,6 @@ pub struct libsql_wal_methods {
 
 pub struct ReplicatorContext {
     pub replicator: crate::replicator::Replicator,
-    pub runtime: tokio::runtime::Runtime,
 }
 
 #[repr(C)]

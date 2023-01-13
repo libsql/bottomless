@@ -37,19 +37,8 @@ pub extern "C" fn xOpen(
     if rc != ffi::SQLITE_OK {
         return rc;
     }
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(e) => {
-            tracing::error!("Failed to initialize async runtime: {}", e);
-            return ffi::SQLITE_CANTOPEN;
-        }
-    };
 
-    let replicator = runtime.block_on(async { replicator::Replicator::new().await });
-    let mut replicator = match replicator {
+    let mut replicator = match replicator::Replicator::new() {
         Ok(repl) => repl,
         Err(e) => {
             tracing::error!("Failed to initialize replicator: {}", e);
@@ -69,10 +58,7 @@ pub extern "C" fn xOpen(
     };
 
     replicator.register_db(path);
-    let context = ffi::ReplicatorContext {
-        replicator,
-        runtime,
-    };
+    let context = ffi::ReplicatorContext { replicator };
     unsafe { (*(*wal)).replicator_context = Box::leak(Box::new(context)) };
 
     ffi::SQLITE_OK
@@ -219,7 +205,7 @@ pub extern "C" fn xFrames(
     // location. It's not complicated, but potentially costly in terms of latency,
     // so for now it is not yet implemented.
     if is_commit != 0 {
-        last_consistent_frame = match ctx.runtime.block_on(async { ctx.replicator.flush().await }) {
+        last_consistent_frame = match ctx.replicator.flush() {
             Ok(frame) => frame,
             Err(e) => {
                 tracing::error!("Failed to replicate: {}", e);
@@ -243,11 +229,10 @@ pub extern "C" fn xFrames(
     if is_commit != 0 {
         let frame_checksum = unsafe { (*wal).hdr.frame_checksum };
 
-        if let Err(e) = ctx.runtime.block_on(async {
-            ctx.replicator
-                .finalize_commit(last_consistent_frame, frame_checksum)
-                .await
-        }) {
+        if let Err(e) = ctx
+            .replicator
+            .finalize_commit(last_consistent_frame, frame_checksum)
+        {
             tracing::error!("Failed to finalize replication: {}", e);
             return ffi::SQLITE_IOERR_WRITE;
         }
@@ -326,9 +311,7 @@ pub extern "C" fn xCheckpoint(
 
     ctx.replicator.new_generation();
     tracing::debug!("Snapshotting after checkpoint");
-    let result = ctx
-        .runtime
-        .block_on(async { ctx.replicator.snapshot_main_db_file().await });
+    let result = ctx.replicator.snapshot_main_db_file();
     if let Err(e) = result {
         tracing::error!(
             "Failed to snapshot the main db file during checkpoint: {}",
@@ -389,23 +372,9 @@ pub extern "C" fn xPreMainDbOpen(_methods: *mut libsql_wal_methods, path: *const
     };
     tracing::debug!("Main database file {} will be open soon", path);
 
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(e) => {
-            tracing::error!("Failed to initialize async runtime: {}", e);
-            return ffi::SQLITE_CANTOPEN;
-        }
-    };
-
-    let replicator = runtime.block_on(async {
-        replicator::Replicator::create(replicator::Options {
-            create_bucket_if_not_exists: true,
-            verify_crc: true,
-        })
-        .await
+    let replicator = replicator::Replicator::create(replicator::Options {
+        create_bucket_if_not_exists: true,
+        verify_crc: true,
     });
     let mut replicator = match replicator {
         Ok(repl) => repl,
@@ -416,33 +385,32 @@ pub extern "C" fn xPreMainDbOpen(_methods: *mut libsql_wal_methods, path: *const
     };
 
     replicator.register_db(path);
-    runtime.block_on(async {
-        match replicator.restore().await {
-            Ok(replicator::RestoreAction::None) => (),
-            Ok(replicator::RestoreAction::SnapshotMainDbFile) => {
-                replicator.new_generation();
-                if let Err(e) = replicator.snapshot_main_db_file().await {
-                    tracing::error!("Failed to snapshot the main db file: {}", e);
-                    return ffi::SQLITE_CANTOPEN;
-                }
-                // Restoration process only leaves the local WAL file if it was
-                // detected to be newer than its remote counterpart.
-                if let Err(e) = replicator.maybe_replicate_wal().await {
-                    tracing::error!("Failed to replicate local WAL: {}", e);
-                    return ffi::SQLITE_CANTOPEN;
-                }
+
+    match replicator.restore() {
+        Ok(replicator::RestoreAction::None) => (),
+        Ok(replicator::RestoreAction::SnapshotMainDbFile) => {
+            replicator.new_generation();
+            if let Err(e) = replicator.snapshot_main_db_file() {
+                tracing::error!("Failed to snapshot the main db file: {}", e);
+                return ffi::SQLITE_CANTOPEN;
             }
-            Ok(replicator::RestoreAction::ReuseGeneration(gen)) => {
-                replicator.set_generation(gen);
-            }
-            Err(e) => {
-                tracing::error!("Failed to restore the database: {}", e);
+            // Restoration process only leaves the local WAL file if it was
+            // detected to be newer than its remote counterpart.
+            if let Err(e) = replicator.maybe_replicate_wal() {
+                tracing::error!("Failed to replicate local WAL: {}", e);
                 return ffi::SQLITE_CANTOPEN;
             }
         }
+        Ok(replicator::RestoreAction::ReuseGeneration(gen)) => {
+            replicator.set_generation(gen);
+        }
+        Err(e) => {
+            tracing::error!("Failed to restore the database: {}", e);
+            return ffi::SQLITE_CANTOPEN;
+        }
+    }
 
-        ffi::SQLITE_OK
-    })
+    ffi::SQLITE_OK
 }
 
 #[no_mangle]
