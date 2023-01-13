@@ -61,9 +61,17 @@ impl Replicator {
         let write_buffer = BTreeMap::new();
         let bucket_name =
             std::env::var("LIBSQL_BOTTOMLESS_BUCKET").unwrap_or_else(|_| "bottomless".to_string());
-        let region = std::env::var("AWS_REGION")
-            .unwrap_or_else(|_| "us-east-1".to_string())
-            .parse()?; // FIXME: get it from .aws profile
+        let region = match std::env::var("LIBSQL_BOTTOMLESS_ENDPOINT") {
+            Ok(endpoint) => s3::region::Region::Custom {
+                region: "dummy".to_owned(),
+                endpoint: endpoint,
+            },
+            Err(_) => {
+                std::env::var("AWS_REGION")
+                    .unwrap_or_else(|_| "us-east-1".to_string())
+                    .parse()? // FIXME: get it from .aws profile
+            }
+        };
         let credentials = s3::creds::Credentials::from_env()?;
         let bucket = s3::bucket::Bucket::new(&bucket_name, region, credentials)?; // FIXME: head_bucket to check if it exists
         let generation = Self::generate_generation();
