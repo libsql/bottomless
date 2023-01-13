@@ -601,6 +601,7 @@ impl Replicator {
                         tracing::info!(
                             "Remote generation is up-to-date, reusing it in this session"
                         );
+                        self.next_frame = wal_pages + 1;
                         return Ok(RestoreAction::ReuseGeneration(generation));
                     }
                     Ordering::Greater => {
