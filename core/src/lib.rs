@@ -496,3 +496,23 @@ pub extern "C" fn bottomless_methods(
         underlying_methods,
     }))
 }
+
+extern "C" {
+    fn libsql_wal_methods_find(name: *const std::ffi::c_char) -> *const libsql_wal_methods;
+    fn libsql_wal_methods_register(methods: *const libsql_wal_methods) -> i32;
+}
+
+pub fn register_bottomless_methods() -> Option<()> {
+    let orig_methods = unsafe { libsql_wal_methods_find(std::ptr::null()) };
+    if orig_methods.is_null() {
+        return None;
+    }
+    let methods = bottomless_methods(orig_methods);
+    let rc = unsafe { libsql_wal_methods_register(methods) };
+    if rc != ffi::SQLITE_OK {
+        let _box = unsafe { Box::from_raw(methods as *mut libsql_wal_methods) };
+        tracing::warn!("Failed to instantiate bottomless WAL methods");
+        return None;
+    }
+    Some(())
+}
