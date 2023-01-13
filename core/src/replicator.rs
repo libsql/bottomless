@@ -73,7 +73,7 @@ impl Replicator {
             }
         };
         let credentials = s3::creds::Credentials::from_env()?;
-        let bucket = s3::bucket::Bucket::new(&bucket_name, region, credentials)?; // FIXME: head_bucket to check if it exists
+        let bucket = s3::bucket::Bucket::new(&bucket_name, region, credentials)?.with_path_style(); // FIXME: head_bucket to check if it exists
         let generation = Self::generate_generation();
         tracing::debug!("Generation {}", generation);
 
