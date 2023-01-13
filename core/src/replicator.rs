@@ -310,6 +310,10 @@ impl Replicator {
             tracing::info!("Local WAL is empty, not replicating");
             return Ok(());
         }
+        if self.page_size == Self::UNSET_PAGE_SIZE {
+            tracing::trace!("Page size not detected yet, not replicated");
+            return Ok(());
+        }
         tracing::trace!("Local WAL pages: {}", (len - 32) / self.page_size as u64);
         wal_file.seek(std::io::SeekFrom::Start(24))?;
         let checksum: [u32; 2] = [
@@ -507,9 +511,9 @@ impl Replicator {
             checksum
         );
 
+        let wal_pages = self.get_local_wal_page_count();
         match local_counter.cmp(&remote_counter) {
             Ordering::Equal => {
-                let wal_pages = self.get_local_wal_page_count();
                 tracing::debug!(
                     "Consistent: {}; wal pages: {}",
                     last_consistent_frame,
