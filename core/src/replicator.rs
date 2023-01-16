@@ -189,11 +189,13 @@ impl Replicator {
     // Sets the last valid frame in the replicated log.
     pub fn register_last_valid_frame(&mut self, frame: u32) {
         if frame != self.peek_last_valid_frame() {
-            tracing::error!(
-                "[BUG] Local max valid frame is {}, while replicator thinks it's {}",
-                frame,
-                self.peek_last_valid_frame()
-            );
+            if self.next_frame != 1 {
+                tracing::error!(
+                    "[BUG] Local max valid frame is {}, while replicator thinks it's {}",
+                    frame,
+                    self.peek_last_valid_frame()
+                );
+            }
             self.next_frame = frame + 1
         }
     }
