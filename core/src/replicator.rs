@@ -68,12 +68,14 @@ impl Replicator {
             },
             Err(_) => {
                 std::env::var("AWS_REGION")
+                    .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
                     .unwrap_or_else(|_| "us-east-1".to_string())
                     .parse()? // FIXME: get it from .aws profile
             }
         };
-        let credentials = s3::creds::Credentials::from_env()?;
-        let bucket = s3::bucket::Bucket::new(&bucket_name, region, credentials)?.with_path_style(); // FIXME: head_bucket to check if it exists
+        let credentials = s3::creds::Credentials::from_env()
+            .or_else(|_| s3::creds::Credentials::from_profile(None))?;
+        let bucket = s3::bucket::Bucket::new(&bucket_name, region, credentials)?.with_path_style();
         let generation = Self::generate_generation();
         tracing::debug!("Generation {}", generation);
 
