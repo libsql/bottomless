@@ -40,6 +40,16 @@ macro_rules! maybe_block_on {
     };
 }
 
+fn is_local() -> bool {
+    std::env::var("LIBSQL_BOTTOMLESS_LOCAL").map_or(false, |local| {
+        local.eq_ignore_ascii_case("true")
+            || local.eq_ignore_ascii_case("t")
+            || local.eq_ignore_ascii_case("yes")
+            || local.eq_ignore_ascii_case("y")
+            || local == "1"
+    })
+}
+
 pub extern "C" fn xOpen(
     vfs: *const sqlite3_vfs,
     db_file: *mut sqlite3_file,
@@ -52,14 +62,21 @@ pub extern "C" fn xOpen(
     tracing::debug!("Opening WAL {}", unsafe {
         std::ffi::CStr::from_ptr(wal_name).to_str().unwrap()
     });
-    if !is_regular(vfs) {
-        tracing::error!("Bottomless WAL is currently only supported for regular VFS");
-        return ffi::SQLITE_CANTOPEN;
-    }
+
     let orig_methods = unsafe { &*(*methods).underlying_methods };
     let rc = (orig_methods.xOpen)(vfs, db_file, wal_name, no_shm_mode, max_size, methods, wal);
     if rc != ffi::SQLITE_OK {
         return rc;
+    }
+
+    if !is_regular(vfs) {
+        tracing::error!("Bottomless WAL is currently only supported for regular VFS");
+        return ffi::SQLITE_CANTOPEN;
+    }
+
+    if is_local() {
+        tracing::info!("Running in local-mode only, without any replication");
+        return ffi::SQLITE_OK;
     }
 
     #[cfg(feature = "async")]
@@ -127,7 +144,9 @@ pub extern "C" fn xClose(
 ) -> i32 {
     tracing::debug!("Closing wal");
     let orig_methods = get_orig_methods(wal);
-    let _replicator_box = unsafe { Box::from_raw((*wal).replicator_context) };
+    if !is_local() {
+        let _replicator_box = unsafe { Box::from_raw((*wal).replicator_context) };
+    }
 
     (orig_methods.xClose)(wal, db, sync_flags, n_buf, z_buf)
 }
@@ -179,7 +198,7 @@ pub extern "C" fn xUndo(
 ) -> i32 {
     let orig_methods = get_orig_methods(wal);
     let rc = (orig_methods.xUndo)(wal, func, ctx);
-    if rc != ffi::SQLITE_OK {
+    if is_local() || rc != ffi::SQLITE_OK {
         return rc;
     }
 
@@ -203,7 +222,7 @@ pub extern "C" fn xSavepoint(wal: *mut Wal, wal_data: *mut u32) {
 pub extern "C" fn xSavepointUndo(wal: *mut Wal, wal_data: *mut u32) -> i32 {
     let orig_methods = get_orig_methods(wal);
     let rc = (orig_methods.xSavepointUndo)(wal, wal_data);
-    if rc != ffi::SQLITE_OK {
+    if is_local() || rc != ffi::SQLITE_OK {
         return rc;
     }
 
@@ -227,39 +246,41 @@ pub extern "C" fn xFrames(
     is_commit: i32,
     sync_flags: i32,
 ) -> i32 {
-    let ctx = get_replicator_context(wal);
-    let last_valid_frame = unsafe { (*wal).hdr.last_valid_frame };
-    ctx.replicator.register_last_valid_frame(last_valid_frame);
-    let orig_methods = get_orig_methods(wal);
-    // In theory it's enough to set the page size only once, but in practice
-    // it's a very cheap operation anyway, and the page is not always known
-    // upfront and can change dynamically.
-    // FIXME: changing the page size in the middle of operation is *not*
-    // supported by bottomless storage.
-    if let Err(e) = ctx.replicator.set_page_size(page_size as usize) {
-        tracing::error!("{}", e);
-        return ffi::SQLITE_IOERR_WRITE;
-    }
-    for (pgno, data) in ffi::PageHdrIter::new(page_headers, page_size as usize) {
-        ctx.replicator.write(pgno, data);
-    }
-
     let mut last_consistent_frame = 0;
-    // TODO: flushing can be done even if is_commit == 0, in order to drain
-    // the local cache and free its memory. However, that complicates rollbacks (xUndo),
-    // because the flushed-but-not-committed pages should be removed from the remote
-    // location. It's not complicated, but potentially costly in terms of latency,
-    // so for now it is not yet implemented.
-    if is_commit != 0 {
-        last_consistent_frame = match maybe_block_on!(ctx.runtime, ctx.replicator.flush()) {
-            Ok(frame) => frame,
-            Err(e) => {
-                tracing::error!("Failed to replicate: {}", e);
-                return ffi::SQLITE_IOERR_WRITE;
-            }
-        };
+    if !is_local() {
+        let ctx = get_replicator_context(wal);
+        let last_valid_frame = unsafe { (*wal).hdr.last_valid_frame };
+        ctx.replicator.register_last_valid_frame(last_valid_frame);
+        // In theory it's enough to set the page size only once, but in practice
+        // it's a very cheap operation anyway, and the page is not always known
+        // upfront and can change dynamically.
+        // FIXME: changing the page size in the middle of operation is *not*
+        // supported by bottomless storage.
+        if let Err(e) = ctx.replicator.set_page_size(page_size as usize) {
+            tracing::error!("{}", e);
+            return ffi::SQLITE_IOERR_WRITE;
+        }
+        for (pgno, data) in ffi::PageHdrIter::new(page_headers, page_size as usize) {
+            ctx.replicator.write(pgno, data);
+        }
+
+        // TODO: flushing can be done even if is_commit == 0, in order to drain
+        // the local cache and free its memory. However, that complicates rollbacks (xUndo),
+        // because the flushed-but-not-committed pages should be removed from the remote
+        // location. It's not complicated, but potentially costly in terms of latency,
+        // so for now it is not yet implemented.
+        if is_commit != 0 {
+            last_consistent_frame = match maybe_block_on!(ctx.runtime, ctx.replicator.flush()) {
+                Ok(frame) => frame,
+                Err(e) => {
+                    tracing::error!("Failed to replicate: {}", e);
+                    return ffi::SQLITE_IOERR_WRITE;
+                }
+            };
+        }
     }
 
+    let orig_methods = get_orig_methods(wal);
     let rc = (orig_methods.xFrames)(
         wal,
         page_size,
@@ -268,10 +289,11 @@ pub extern "C" fn xFrames(
         is_commit,
         sync_flags,
     );
-    if rc != ffi::SQLITE_OK {
+    if is_local() || rc != ffi::SQLITE_OK {
         return rc;
     }
 
+    let ctx = get_replicator_context(wal);
     if is_commit != 0 {
         let frame_checksum = unsafe { (*wal).hdr.frame_checksum };
 
@@ -334,7 +356,6 @@ pub extern "C" fn xCheckpoint(
     };
 
     let orig_methods = get_orig_methods(wal);
-    let ctx = get_replicator_context(wal);
     let rc = (orig_methods.xCheckpoint)(
         wal,
         db,
@@ -347,10 +368,12 @@ pub extern "C" fn xCheckpoint(
         frames_in_wal,
         backfilled_frames,
     );
-    if rc != ffi::SQLITE_OK {
+
+    if is_local() || rc != ffi::SQLITE_OK {
         return rc;
     }
 
+    let ctx = get_replicator_context(wal);
     if ctx.replicator.commits_in_current_generation == 0 {
         tracing::debug!("No commits happened in this generation, not snapshotting");
         return ffi::SQLITE_OK;
@@ -463,6 +486,11 @@ async fn try_restore(replicator: &mut replicator::Replicator) -> i32 {
 }
 
 pub extern "C" fn xPreMainDbOpen(_methods: *mut libsql_wal_methods, path: *const i8) -> i32 {
+    if is_local() {
+        tracing::info!("Running in local-mode only, without any replication");
+        return ffi::SQLITE_OK;
+    }
+
     if path.is_null() {
         return ffi::SQLITE_OK;
     }
