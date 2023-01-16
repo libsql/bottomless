@@ -391,8 +391,15 @@ impl Replicator {
          ** Instead, we need to consult WAL checksums.
          */
         let change_counter_key = format!("{}-{}/.changecounter", self.db_name, self.generation);
-        self.bucket
+        let response = self
+            .bucket
             .put_object(change_counter_key, &change_counter)?;
+        if response.status_code() != 200 {
+            return Err(anyhow::anyhow!(
+                "Failed to snapshot main db file, status {}",
+                response.status_code()
+            ));
+        }
         tracing::debug!("Main db snapshot complete");
         Ok(())
     }
