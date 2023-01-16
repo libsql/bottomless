@@ -124,7 +124,10 @@ pub struct Wal {
     p_snapshot: *const c_void,
     p_db: *const c_void,
     pub wal_methods: *mut libsql_wal_methods,
-    pub replicator_context: *mut ReplicatorContext,
+    #[cfg(feature = "async")]
+    pub replicator_context: *mut crate::replicator::Context,
+    #[cfg(feature = "sync")]
+    pub replicator_context: *mut crate::replicator_sync::Context,
 }
 
 #[repr(C)]
@@ -218,11 +221,6 @@ pub struct libsql_wal_methods {
 
     // User data
     pub underlying_methods: *const libsql_wal_methods,
-}
-
-pub struct ReplicatorContext {
-    pub replicator: crate::replicator::Replicator,
-    pub runtime: tokio::runtime::Runtime,
 }
 
 #[repr(C)]
