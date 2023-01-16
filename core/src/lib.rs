@@ -58,6 +58,11 @@ pub extern "C" fn xOpen(
     };
 
     replicator.register_db(path);
+    let rc = try_restore(&mut replicator);
+    if rc != ffi::SQLITE_OK {
+        return rc;
+    }
+
     let context = ffi::ReplicatorContext { replicator };
     unsafe { (*(*wal)).replicator_context = Box::leak(Box::new(context)) };
 
@@ -357,6 +362,34 @@ pub extern "C" fn xGetPathname(buf: *mut u8, orig: *const u8, orig_len: i32) {
     unsafe { std::ptr::copy("-wal".as_ptr(), buf.offset(orig_len as isize), 4) }
 }
 
+fn try_restore(replicator: &mut replicator::Replicator) -> i32 {
+    match replicator.restore() {
+        Ok(replicator::RestoreAction::None) => (),
+        Ok(replicator::RestoreAction::SnapshotMainDbFile) => {
+            replicator.new_generation();
+            if let Err(e) = replicator.snapshot_main_db_file() {
+                tracing::error!("Failed to snapshot the main db file: {}", e);
+                return ffi::SQLITE_CANTOPEN;
+            }
+            // Restoration process only leaves the local WAL file if it was
+            // detected to be newer than its remote counterpart.
+            if let Err(e) = replicator.maybe_replicate_wal() {
+                tracing::error!("Failed to replicate local WAL: {}", e);
+                return ffi::SQLITE_CANTOPEN;
+            }
+        }
+        Ok(replicator::RestoreAction::ReuseGeneration(gen)) => {
+            replicator.set_generation(gen);
+        }
+        Err(e) => {
+            tracing::error!("Failed to restore the database: {}", e);
+            return ffi::SQLITE_CANTOPEN;
+        }
+    }
+
+    ffi::SQLITE_OK
+}
+
 pub extern "C" fn xPreMainDbOpen(_methods: *mut libsql_wal_methods, path: *const i8) -> i32 {
     if path.is_null() {
         return ffi::SQLITE_OK;
@@ -386,31 +419,7 @@ pub extern "C" fn xPreMainDbOpen(_methods: *mut libsql_wal_methods, path: *const
 
     replicator.register_db(path);
 
-    match replicator.restore() {
-        Ok(replicator::RestoreAction::None) => (),
-        Ok(replicator::RestoreAction::SnapshotMainDbFile) => {
-            replicator.new_generation();
-            if let Err(e) = replicator.snapshot_main_db_file() {
-                tracing::error!("Failed to snapshot the main db file: {}", e);
-                return ffi::SQLITE_CANTOPEN;
-            }
-            // Restoration process only leaves the local WAL file if it was
-            // detected to be newer than its remote counterpart.
-            if let Err(e) = replicator.maybe_replicate_wal() {
-                tracing::error!("Failed to replicate local WAL: {}", e);
-                return ffi::SQLITE_CANTOPEN;
-            }
-        }
-        Ok(replicator::RestoreAction::ReuseGeneration(gen)) => {
-            replicator.set_generation(gen);
-        }
-        Err(e) => {
-            tracing::error!("Failed to restore the database: {}", e);
-            return ffi::SQLITE_CANTOPEN;
-        }
-    }
-
-    ffi::SQLITE_OK
+    try_restore(&mut replicator)
 }
 
 #[no_mangle]
