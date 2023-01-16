@@ -497,11 +497,13 @@ pub extern "C" fn bottomless_methods(
     }))
 }
 
+#[cfg(feature = "libsql_linked_statically")]
 extern "C" {
     fn libsql_wal_methods_find(name: *const std::ffi::c_char) -> *const libsql_wal_methods;
     fn libsql_wal_methods_register(methods: *const libsql_wal_methods) -> i32;
 }
 
+#[cfg(feature = "libsql_linked_statically")]
 pub fn register_bottomless_methods() -> Option<()> {
     bottomless_init();
     let orig_methods = unsafe { libsql_wal_methods_find(std::ptr::null()) };
