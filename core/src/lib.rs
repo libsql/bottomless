@@ -590,6 +590,8 @@ pub extern "C" fn bottomless_methods(
 
 #[cfg(feature = "libsql_linked_statically")]
 pub mod static_init {
+    use crate::libsql_wal_methods;
+
     static BOTTOMLESS_REGISTERED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
@@ -603,14 +605,14 @@ pub mod static_init {
             return None;
         }
         BOTTOMLESS_REGISTERED.store(true, std::sync::atomic::Ordering::Release);
-        bottomless_init();
+        crate::bottomless_init();
         let orig_methods = unsafe { libsql_wal_methods_find(std::ptr::null()) };
         if orig_methods.is_null() {
             return None;
         }
-        let methods = bottomless_methods(orig_methods);
+        let methods = crate::bottomless_methods(orig_methods);
         let rc = unsafe { libsql_wal_methods_register(methods) };
-        if rc != ffi::SQLITE_OK {
+        if rc != crate::ffi::SQLITE_OK {
             let _box = unsafe { Box::from_raw(methods as *mut libsql_wal_methods) };
             tracing::warn!("Failed to instantiate bottomless WAL methods");
             return None;
