@@ -592,31 +592,23 @@ pub extern "C" fn bottomless_methods(
 pub mod static_init {
     use crate::libsql_wal_methods;
 
-    static BOTTOMLESS_REGISTERED: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
-
     extern "C" {
         fn libsql_wal_methods_find(name: *const std::ffi::c_char) -> *const libsql_wal_methods;
         fn libsql_wal_methods_register(methods: *const libsql_wal_methods) -> i32;
     }
 
-    pub fn register_bottomless_methods() -> Option<()> {
-        if BOTTOMLESS_REGISTERED.load(std::sync::atomic::Ordering::Acquire) {
-            return None;
-        }
-        BOTTOMLESS_REGISTERED.store(true, std::sync::atomic::Ordering::Release);
-        crate::bottomless_init();
-        let orig_methods = unsafe { libsql_wal_methods_find(std::ptr::null()) };
-        if orig_methods.is_null() {
-            return None;
-        }
-        let methods = crate::bottomless_methods(orig_methods);
-        let rc = unsafe { libsql_wal_methods_register(methods) };
-        if rc != crate::ffi::SQLITE_OK {
-            let _box = unsafe { Box::from_raw(methods as *mut libsql_wal_methods) };
-            tracing::warn!("Failed to instantiate bottomless WAL methods");
-            return None;
-        }
-        Some(())
+    pub fn register_bottomless_methods() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            crate::bottomless_init();
+            let orig_methods = unsafe { libsql_wal_methods_find(std::ptr::null()) };
+            if orig_methods.is_null() {}
+            let methods = crate::bottomless_methods(orig_methods);
+            let rc = unsafe { libsql_wal_methods_register(methods) };
+            if rc != crate::ffi::SQLITE_OK {
+                let _box = unsafe { Box::from_raw(methods as *mut libsql_wal_methods) };
+                tracing::warn!("Failed to instantiate bottomless WAL methods");
+            }
+        })
     }
 }
