@@ -143,12 +143,14 @@ impl Replicator {
     // Registers a database path for this replicator.
     pub fn register_db(&mut self, db_path: impl Into<String>) {
         let db_path = db_path.into();
+        // An optional prefix to differentiate between databases with the same filename
+        let db_id = std::env::var("LIBSQL_BOTTOMLESS_DATABASE_ID").unwrap_or_default();
         let name = match db_path.rfind('/') {
-            Some(index) => db_path[index + 1..].to_string(),
-            None => db_path.to_string(),
+            Some(index) => &db_path[index + 1..],
+            None => &db_path,
         };
+        self.db_name = db_id + name;
         self.db_path = db_path;
-        self.db_name = name;
         tracing::trace!("Registered {} (full path: {})", self.db_name, self.db_path);
     }
 
