@@ -13,7 +13,7 @@ int sqlite3_bottomless_init(
   sqlite3 *db, 
   char **pzErrMsg, 
   const sqlite3_api_routines *pApi,
-  const libsql_api_routines *pLibsqlApi,
+  const libsql_api_routines *pLibsqlApi
 ) {
   // yes, racy
   static int initialized = 0;
@@ -42,7 +42,7 @@ int sqlite3_bottomless_init(
 }
 
 int libsqlBottomlessInit(sqlite3 *db) {
-  return sqlite3_bottomless_init(db, NULL, NULL);
+  return sqlite3_bottomless_init(db, NULL, NULL, NULL);
 }
 
 #endif
