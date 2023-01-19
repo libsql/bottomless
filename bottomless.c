@@ -2,6 +2,7 @@
 
 #include "sqlite3ext.h"
 SQLITE_EXTENSION_INIT1
+LIBSQL_EXTENSION_INIT1
 
 #include <stdio.h>
 
@@ -11,7 +12,8 @@ extern struct libsql_wal_methods* bottomless_methods(struct libsql_wal_methods*)
 int sqlite3_bottomless_init(
   sqlite3 *db, 
   char **pzErrMsg, 
-  const sqlite3_api_routines *pApi
+  const sqlite3_api_routines *pApi,
+  const libsql_api_routines *pLibsqlApi,
 ) {
   // yes, racy
   static int initialized = 0;
@@ -22,6 +24,7 @@ int sqlite3_bottomless_init(
   }
 
   SQLITE_EXTENSION_INIT2(pApi);
+  LIBSQL_EXTENSION_INIT2(pLibsqlApi);
 
   bottomless_init();
   struct libsql_wal_methods *orig = libsql_wal_methods_find(0);
