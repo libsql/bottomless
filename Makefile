@@ -12,8 +12,12 @@ release_standalone:	bottomless.c core/src/lib.rs
 		clang -fPIC -shared -I libsql/ -DLIBSQL_ENABLE_BOTTOMLESS_WAL bottomless.c target/release/libbottomless.a \
 		-o target/release/bottomless.so
 
-debug_sync:
+debug_sync:	prep debug_sync_standalone
 	cargo build -p bottomless --no-default-features -F sync && clang -Wall -fPIC -shared -Ilibsql/ -DLIBSQL_ENABLE_BOTTOMLESS_WAL bottomless.c target/debug/libbottomless.a -o target/debug/bottomless.so
+
+debug_sync_standalone:	bottomless.c core/src/lib.rs
+	cargo build -p bottomless --no-default-features -F sync && clang -Wall -fPIC -shared -Ilibsql/ -DLIBSQL_ENABLE_BOTTOMLESS_WAL bottomless.c target/debug/libbottomless.a -o target/debug/bottomless.so
+
 
 prep:
 	( cd libsql && make || ( ./configure && make ) )
