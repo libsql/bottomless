@@ -75,6 +75,17 @@ impl Replicator {
         };
         let credentials = s3::creds::Credentials::from_env()
             .or_else(|_| s3::creds::Credentials::from_profile(None))?;
+        if options.create_bucket_if_not_exists {
+            // Just throw a "create bucket" request and ignore the result
+            let bucket_config = s3::bucket_ops::BucketConfiguration::default();
+            s3::bucket::Bucket::create_with_path_style(
+                &bucket_name,
+                region.clone(),
+                credentials.clone(),
+                bucket_config,
+            )
+            .ok();
+        }
         let bucket = s3::bucket::Bucket::new(&bucket_name, region, credentials)?.with_path_style();
         let generation = Self::generate_generation();
         tracing::debug!("Generation {}", generation);
