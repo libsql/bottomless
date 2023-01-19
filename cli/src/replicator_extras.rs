@@ -88,6 +88,10 @@ impl Replicator {
                 list_request = list_request.marker(marker)
             }
 
+            if verbose {
+                println!("Database {}:", self.db_name);
+            }
+
             let response = list_request.send().await?;
             let prefixes = match response.common_prefixes() {
                 Some(prefixes) => prefixes,
