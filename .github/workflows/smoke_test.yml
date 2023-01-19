@@ -20,6 +20,7 @@ jobs:
       AWS_DEFAULT_REGION: eu-central-2
       LIBSQL_BOTTOMLESS_BUCKET: bottomless
       LIBSQL_BOTTOMLESS_ENDPOINT: http://localhost:9000
+      RUST_LOG: trace
     steps:
     - uses: actions/checkout@v3
 
