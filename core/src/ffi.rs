@@ -124,10 +124,7 @@ pub struct Wal {
     p_snapshot: *const c_void,
     p_db: *const c_void,
     pub wal_methods: *mut libsql_wal_methods,
-    #[cfg(feature = "async")]
     pub replicator_context: *mut crate::replicator::Context,
-    #[cfg(feature = "sync")]
-    pub replicator_context: *mut crate::replicator_sync::Context,
 }
 
 #[repr(C)]
