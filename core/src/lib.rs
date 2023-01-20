@@ -488,7 +488,6 @@ pub extern "C" fn xPreMainDbOpen(_methods: *mut libsql_wal_methods, path: *const
 
 #[no_mangle]
 pub extern "C" fn bottomless_init() {
-    tracing_subscriber::fmt::init();
     tracing::debug!("bottomless module initialized");
 }
 
